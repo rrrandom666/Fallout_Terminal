@@ -25,6 +25,7 @@ import sys
 import time
 import queue
 import datetime
+import random
 
 import pygame
 
@@ -109,6 +110,21 @@ SOUND_FILES = {
     "error": "FalloutSoundError.wav",        # неверный пароль, ошибка, неизвестная команда
     "unlocked": "FalloutSoundUnlocked.wav",  # верный пароль, доступ разрешён
 }
+
+# --------------------------------------------------------------------------
+# Заставка перед загрузкой терминала (картинка + музыка + прогресс-бар)
+# --------------------------------------------------------------------------
+SPLASH_IMAGE_PATH = os.path.join("images", "splash.png")
+SPLASH_MUSIC_PATH = os.path.join("media", "maybe.mp3")
+
+SPLASH_TICK_MIN = 0.02       # обычная задержка между приростом на 1% (сек)
+SPLASH_TICK_MAX = 0.06
+SPLASH_STALL_CHANCE = 0.12   # вероятность "зависания" на случайном проценте
+SPLASH_STALL_MIN = 0.25
+SPLASH_STALL_MAX = 0.7
+SPLASH_HOLD_AT_100 = 0.6     # пауза на 100%, прежде чем перейти к загрузке
+SPLASH_BAR_WIDTH = 420
+SPLASH_BAR_HEIGHT = 22
 
 FINANCIAL_REPORT_TEXT = (
     "КВАРТАЛЬНЫЙ ХОЗЯЙСТВЕННЫЙ ОТЧЁТ\n"
@@ -239,6 +255,7 @@ class OutputBuffer:
 # Приложение
 # --------------------------------------------------------------------------
 class TerminalApp:
+    STATE_SPLASH = "SPLASH"
     STATE_BOOT = "BOOT"
     STATE_PASSWORD = "PASSWORD"
     STATE_AUTH_SUCCESS = "AUTH_SUCCESS"
@@ -326,7 +343,16 @@ class TerminalApp:
             print(f"[звук] аудио недоступно, работаю без звука: {e}")
             self.sound_enabled = False
 
-        self._boot()
+        self.splash_progress = 0
+        self.splash_next_tick_at = 0.0
+        self.splash_image = None
+        try:
+            img = pygame.image.load(SPLASH_IMAGE_PATH)
+            self.splash_image = pygame.transform.smoothscale(img.convert_alpha(), (RENDER_W, RENDER_H))
+        except (pygame.error, FileNotFoundError) as e:
+            print(f"[заставка] не удалось загрузить {SPLASH_IMAGE_PATH}: {e}")
+
+        self._enter_splash()
 
     # -------------------------------------------------------------- звук
     def _play(self, name):
@@ -360,7 +386,49 @@ class TerminalApp:
             except pygame.error:
                 pass
             self._typing_loop_active = False
+    # ------------------------------------------------------------- заставка
+    def _enter_splash(self):
+        self.state = self.STATE_SPLASH
+        self.fixed_header = False
+        self.splash_progress = 0
+        self.splash_next_tick_at = time.time() + random.uniform(SPLASH_TICK_MIN, SPLASH_TICK_MAX)
 
+        if self.sound_enabled:
+            try:
+                pygame.mixer.music.load(SPLASH_MUSIC_PATH)
+                pygame.mixer.music.play(loops=-1)
+            except (pygame.error, FileNotFoundError) as e:
+                print(f"[заставка] не удалось загрузить музыку {SPLASH_MUSIC_PATH}: {e}")
+
+    def _update_splash(self):
+        if self.splash_progress >= 100:
+            return
+        now = time.time()
+        if now < self.splash_next_tick_at:
+            return
+        self.splash_progress += 1
+        if self.splash_progress >= 100:
+            self.splash_progress = 100
+            self._schedule(SPLASH_HOLD_AT_100, self._leave_splash)
+            return
+        if random.random() < SPLASH_STALL_CHANCE:
+            delay = random.uniform(SPLASH_STALL_MIN, SPLASH_STALL_MAX)
+        else:
+            delay = random.uniform(SPLASH_TICK_MIN, SPLASH_TICK_MAX)
+        self.splash_next_tick_at = now + delay
+
+    def _leave_splash(self):
+        if self.sound_enabled:
+            try:
+                pygame.mixer.music.fadeout(400)
+            except pygame.error:
+                pass
+        self._boot()
+
+    def _skip_splash(self):
+        if self.state != self.STATE_SPLASH:
+            return
+        self._leave_splash()
     # ---------------------------------------------------------------- boot
     def _boot(self):
         self.fixed_header = True
@@ -705,6 +773,10 @@ class TerminalApp:
         if event.type == pygame.QUIT:
             self.running = False
         elif event.type == pygame.KEYDOWN:
+            if self.state == self.STATE_SPLASH:
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
+                    self._skip_splash()
+                return
             if event.key == pygame.K_ESCAPE:
                 self.running = False
             elif event.key == pygame.K_UP:
@@ -745,6 +817,8 @@ class TerminalApp:
 
     # --------------------------------------------------------------- кадр
     def update(self, dt):
+        if self.state == self.STATE_SPLASH:
+            self._update_splash()
         self.output.update()
         self._sync_typing_loop(self.output.is_typing())
         self._poll_chat_incoming()
@@ -760,9 +834,54 @@ class TerminalApp:
             self._pending_callback_at = None
             callback()
 
+    def _render_splash(self, surf):
+        if self.splash_image is not None:
+            surf.blit(self.splash_image, (0, 0))
+        else:
+            surf.fill(COLOR_BG)
+
+        bar_x = (RENDER_W - SPLASH_BAR_WIDTH) // 2
+        bar_y = RENDER_H - 90
+
+        bar_x = (RENDER_W - SPLASH_BAR_WIDTH) // 2
+        bar_y = RENDER_H - 90
+
+        # Полупрозрачная тёмная подложка под текст и прогресс-бар,
+        # чтобы они не терялись на светлых участках картинки.
+        panel_padding = 16
+        panel_width = SPLASH_BAR_WIDTH + panel_padding * 2
+        panel_top = bar_y - self.font.get_linesize() - 6 - panel_padding
+        panel_height = (bar_y + SPLASH_BAR_HEIGHT) - panel_top + panel_padding
+        panel_x = (RENDER_W - panel_width) // 2
+        panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 160))
+        surf.blit(panel, (panel_x, panel_top))
+
+        label = f"ЗАГРУЗКА {self.splash_progress:03d}%"
+
+        label = f"ЗАГРУЗКА {self.splash_progress:03d}%"
+        label_surf = self.font.render(label, True, COLOR_TEXT)
+        label_x = (RENDER_W - label_surf.get_width()) // 2
+        surf.blit(label_surf, (label_x, bar_y - self.font.get_linesize() - 6))
+
+        pygame.draw.rect(surf, COLOR_TEXT, (bar_x, bar_y, SPLASH_BAR_WIDTH, SPLASH_BAR_HEIGHT), width=2)
+        fill_w = int((SPLASH_BAR_WIDTH - 4) * (self.splash_progress / 100))
+        if fill_w > 0:
+            pygame.draw.rect(surf, COLOR_TEXT, (bar_x + 2, bar_y + 2, fill_w, SPLASH_BAR_HEIGHT - 4))
+
+        surf.blit(self.scanlines, (0, 0))
+        surf.blit(self.vignette, (0, 0))
+
     def render(self):
         surf = self.render_surface
         surf.fill(COLOR_BG)
+
+        if self.state == self.STATE_SPLASH:
+            self._render_splash(surf)
+            scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
+            self.window.blit(scaled, (0, 0))
+            pygame.display.flip()
+            return
 
         y = MARGIN
         line_h = self.font.get_linesize() + LINE_SPACING
