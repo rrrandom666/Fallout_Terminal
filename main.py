@@ -24,6 +24,7 @@ import os
 import sys
 import time
 import queue
+import datetime
 
 import pygame
 
@@ -72,28 +73,39 @@ VIGNETTE_ALPHA_MAX = 90
 TYPEWRITER_CHARS_PER_FRAME = 2
 SCROLL_STEP = 3  # строк за одно нажатие/повтор стрелки
 
+# --- Легко менять при необходимости --------------------------------------
 MAX_PASSWORD_ATTEMPTS = 4
 CORRECT_PASSWORD = "HAPPINESS"
+AUTH_SUCCESS_DELAY_SECONDS = 2.5   # после верного пароля, перед главным меню
+LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
+MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
+GAME_YEAR = 2276                       
+UNAUTHORIZED_USER_LABEL = "АНОНИМ"     
+AUTHORIZED_USER_LABEL = "БИЛЛ ВАССОН"  
+# ---------------------------------------------------------------------------
 
-# Закреплённая шапка — отображается статично сверху во ВСЕХ состояниях,
-# включая BOOT и PASSWORD (они делят один и тот же экран/буфер — текст
-# загрузки и запрос пароля идут последовательно на одном месте под шапкой).
+MONTH_ABBR_RU = [
+    "ЯНВ", "ФЕВ", "МАР", "АПР", "МАЯ", "ИЮН",
+    "ИЮЛ", "АВГ", "СЕН", "ОКТ", "НОЯ", "ДЕК",
+]
+TIMEZONE_GMT3 = datetime.timezone(datetime.timedelta(hours=3))
+
+# Закреплённая шапка — отображается статично сверху во всех состояниях
 HEADER_BANNER = (
-    "========== ROBCO INDUSTRIES UNIFIED OPERATING SYSTEM ==========\n"
-    "============ COPYRIGHT 2075-2077 ROBCO INDUSTRIES ============="
+    "================ ROBCO INDUSTRIES UNIFIED OPERATING SYSTEM ================\n"
+    "================== COPYRIGHT 2075-2077 ROBCO INDUSTRIES ==================="
 )
-HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n"))
+HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n")) + 1  # +1 — строка статуса (дата/пользователь)
 HEADER_GAP_LINES = 1  # пустая строка-отступ между шапкой и прокручиваемым текстом
 
 FOREMANS_LOG_DIR = os.path.join("FalloutDocuments", "Foreman's Log")
 
-# Звуки — реальные файлы из проекта, лежат в папке media/ рядом с main.py.
-# Регистр в именах сохранён как есть (важно на Linux — там ФС регистрозависима).
+# Звуки
 SOUND_DIR = "media"
 SOUND_FILES = {
     "clicking": "FalloutSoundClicking.mp3",  # печать текста (лупом, пока идёт анимация)
     "clack": "FalloutSoundClack.mp3",        # каждое нажатие клавиши игроком
-    "complete": "FalloutSoundComplete.wav",  # успешное действие (сохранение, дверь, соединение)
+    "complete": "FalloutSoundComplete.wav",  # успешное действие
     "error": "FalloutSoundError.wav",        # неверный пароль, ошибка, неизвестная команда
     "unlocked": "FalloutSoundUnlocked.wav",  # верный пароль, доступ разрешён
 }
@@ -102,7 +114,6 @@ FINANCIAL_REPORT_TEXT = (
     "КВАРТАЛЬНЫЙ ХОЗЯЙСТВЕННЫЙ ОТЧЁТ\n"
     "----------------------------\n"
     "Внутренняя информация корпорации Vault-Tec.\n"
-    "Уровень доступа: БИЛЛ ВАССОН\n\n"
     "[Замените этот текст своими игровыми материалами]"
 )
 
@@ -230,6 +241,7 @@ class OutputBuffer:
 class TerminalApp:
     STATE_BOOT = "BOOT"
     STATE_PASSWORD = "PASSWORD"
+    STATE_AUTH_SUCCESS = "AUTH_SUCCESS"
     STATE_CLOSING = "CLOSING"
     STATE_MAIN_MENU = "MAIN_MENU"
     STATE_FINANCIAL = "FINANCIAL"
@@ -280,9 +292,11 @@ class TerminalApp:
 
         # Авторизация
         self.password_attempts_used = 0
+        self.current_user = UNAUTHORIZED_USER_LABEL
 
-        # Отложенное закрытие терминала (даём прочитать финальное сообщение)
-        self._close_at = None
+        # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
+        self._pending_callback = None
+        self._pending_callback_at = None
 
         # Сеть (чат с мастером)
         self.mqtt_client = None
@@ -379,7 +393,6 @@ class TerminalApp:
         self.fixed_header = True
         self.output.clear()
         self.output.push(
-            "Вы авторизованы как: БИЛЛ ВАССОН\n"
             "[1. Журнал                 ]\n"
             "[2. Хозяйственные отчёты   ]\n"
             "[3. Отчёты по безопасности ]\n"
@@ -534,7 +547,7 @@ class TerminalApp:
         self._chat_status_resolved = True
 
     def _send_chat_message(self, text):
-        self.output.push(f">[БИЛЛ ВАСССОН]: {text}\n", instant=True)
+        self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
         if self.mqtt_connected and self.mqtt_client is not None:
             try:
                 self.mqtt_client.publish(TOPIC_TO_MASTER, text, qos=1)
@@ -556,27 +569,31 @@ class TerminalApp:
 
         if self.state == self.STATE_PASSWORD:
             if text.upper() == CORRECT_PASSWORD:
-                self.output.push(f">[ПОЛЬЗОВАТЕЛЬ]: {text}\n", instant=True)
+                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
                 self._play("unlocked")
-                self._enter_main_menu()
+                self.current_user = AUTHORIZED_USER_LABEL
+                self.state = self.STATE_AUTH_SUCCESS
+                self.output.push(f"ПАРОЛЬ ПРИНЯТ\nВы авторизованы как: {self.current_user}\n", instant=True)
+                self._schedule(AUTH_SUCCESS_DELAY_SECONDS, self._enter_main_menu)
                 return
             self.password_attempts_used += 1
             attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
             if attempts_left <= 0:
                 self._play("error")
                 self.state = self.STATE_CLOSING
-                self.output.push("\nДОСТУП ЗАПРЕЩЁН.\nВыключение...\n", instant=True)
-                self._close_at = time.time() + 2.5
+                self.output.push("\nДОСТУП ЗАПРЕЩЁН\nВыключение...\n", instant=True)
+                self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
             else:
-                self.output.push(f">[ПОЛЬЗОВАТЕЛЬ]: {text}\n", instant=True)
+                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
                 self._play("error")
-                self._enter_password(extra_message="НЕВЕРНЫЙ ПАРОЛЬ.")
+                self._enter_password(extra_message="НЕВЕРНЫЙ ПАРОЛЬ")
             return
 
-        if self.state == self.STATE_CLOSING:
-            return  # терминал уже закрывается, ввод игнорируем
+        if self.state in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
+            return  # ввод игнорируем
 
         if self.state == self.STATE_MAIN_MENU:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             self._handle_main_menu(text)
             return
 
@@ -585,6 +602,7 @@ class TerminalApp:
             return
 
         if self.state == self.STATE_LOG_LIST:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if text == "0" or text == "":
                 self._enter_main_menu()
             elif text.isdigit():
@@ -606,10 +624,12 @@ class TerminalApp:
             return
 
         if self.state == self.STATE_LOG_NEW:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             self._handle_log_new_input(text)
             return
 
         if self.state == self.STATE_DOOR:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if text == "1":
                 self.door_status = "ОТКРЫТА"
                 self._play("complete")
@@ -653,7 +673,9 @@ class TerminalApp:
         elif text == "6":
             self._enter_chat()
         elif text == "0":
-            self.running = False
+            self.state = self.STATE_CLOSING
+            self.output.push("\nЗавершение сеанса...\nВыключение...\n")
+            self._schedule(MENU_CLOSE_DELAY_SECONDS, self._quit)
         else:
             self._play("error")
             self.output.push("\nНеизвестная команда.\n", instant=True)
@@ -707,6 +729,20 @@ class TerminalApp:
     def _current_max_lines(self):
         return self.max_visible_lines_header if self.fixed_header else self.max_visible_lines_full
 
+    def _schedule(self, delay_seconds, callback):
+        """Выполнить callback() через delay_seconds. Пока действие не сработало,
+        предыдущее состояние (текст на экране) остаётся видимым как есть."""
+        self._pending_callback = callback
+        self._pending_callback_at = time.time() + delay_seconds
+
+    def _quit(self):
+        self.running = False
+    
+    def _current_datetime_str(self):
+        now = datetime.datetime.now(TIMEZONE_GMT3)
+        month = MONTH_ABBR_RU[now.month - 1]
+        return f"{now.day:02d} {month} {GAME_YEAR} {now.hour:02d}:{now.minute:02d}"
+
     # --------------------------------------------------------------- кадр
     def update(self, dt):
         self.output.update()
@@ -718,8 +754,11 @@ class TerminalApp:
             self.cursor_timer = 0.0
             self.cursor_visible = not self.cursor_visible
 
-        if self._close_at is not None and time.time() >= self._close_at:
-            self.running = False
+        if self._pending_callback is not None and time.time() >= self._pending_callback_at:
+            callback = self._pending_callback
+            self._pending_callback = None
+            self._pending_callback_at = None
+            callback()
 
     def render(self):
         surf = self.render_surface
@@ -736,6 +775,16 @@ class TerminalApp:
                 header_surf = self.font.render(header_line, True, COLOR_TEXT)
                 surf.blit(header_surf, (MARGIN, y))
                 y += line_h
+
+            # Строка статуса: дата слева, пользователь справа, одна строка.
+            date_str = self._current_datetime_str()
+            user_str = f"Пользователь: {self.current_user}"
+            date_surf = self.font.render(date_str, True, COLOR_TEXT)
+            user_surf = self.font.render(user_str, True, COLOR_TEXT)
+            surf.blit(date_surf, (MARGIN, y))
+            surf.blit(user_surf, (RENDER_W - MARGIN - user_surf.get_width(), y))
+            y += line_h
+
             y += line_h * HEADER_GAP_LINES
 
         content_top_y = y
@@ -755,7 +804,7 @@ class TerminalApp:
             surf.blit(indicator, (MARGIN, y))
         y += line_h  # аналогично резервируем строку снизу
 
-        if not self.output.is_typing() and self.state != self.STATE_CLOSING:
+        if not self.output.is_typing() and self.state not in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
             prompt = "> " + self.input_text + ("_" if self.cursor_visible else " ")
             prompt_surf = self.font.render(prompt, True, COLOR_TEXT)
             surf.blit(prompt_surf, (MARGIN, y))
