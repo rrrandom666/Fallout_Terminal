@@ -99,8 +99,13 @@ HEADER_BANNER = (
 HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n")) + 1  # +1 — строка статуса (дата/пользователь)
 HEADER_GAP_LINES = 1  # пустая строка-отступ между шапкой и прокручиваемым текстом
 
-FOREMANS_LOG_DIR = os.path.join("FalloutDocuments", "Foreman's Log")
+JOURNAL_DIR = "journal"
 CHAT_HISTORY_DIR = "chat_history"
+DATA_DIR = "data"
+
+# Включаемые модули меню — легко выключить, если на конкретной игре не нужны
+ENABLE_DOOR_CONTROL = True
+ENABLE_CHAT = True
 
 # Звуки
 SOUND_DIR = "media"
@@ -126,20 +131,6 @@ SPLASH_STALL_MAX = 0.7
 SPLASH_HOLD_AT_100 = 0.6     # пауза на 100%, прежде чем перейти к загрузке
 SPLASH_BAR_WIDTH = 420
 SPLASH_BAR_HEIGHT = 22
-
-FINANCIAL_REPORT_TEXT = (
-    "КВАРТАЛЬНЫЙ ХОЗЯЙСТВЕННЫЙ ОТЧЁТ\n"
-    "----------------------------\n"
-    "Внутренняя информация корпорации Vault-Tec.\n"
-    "[Замените этот текст своими игровыми материалами]"
-)
-
-SAFETY_REPORT_TEXT = (
-    "ОТЧЁТ ПО БЕЗОПАСНОСТИ\n"
-    "--------------------\n"
-    "В текущем цикле инцидентов не выявлено.\n\n"
-    "[Замените этот текст своими игровыми материалами]"
-)
 
 
 # --------------------------------------------------------------------------
@@ -262,11 +253,11 @@ class TerminalApp:
     STATE_AUTH_SUCCESS = "AUTH_SUCCESS"
     STATE_CLOSING = "CLOSING"
     STATE_MAIN_MENU = "MAIN_MENU"
-    STATE_FINANCIAL = "FINANCIAL"
-    STATE_SAFETY = "SAFETY"
     STATE_LOG_LIST = "LOG_LIST"
     STATE_LOG_VIEW = "LOG_VIEW"
     STATE_LOG_NEW = "LOG_NEW"
+    STATE_DATA_LIST = "DATA_LIST"
+    STATE_DATA_VIEW = "DATA_VIEW"
     STATE_DOOR = "DOOR"
     STATE_CHAT_MENU = "CHAT_MENU"
     STATE_CHAT_HISTORY_LIST = "CHAT_HISTORY_LIST"
@@ -276,7 +267,10 @@ class TerminalApp:
 
     def __init__(self):
         pygame.init()
-        pygame.key.set_repeat(400, 40)  # удержание клавиши повторяет KEYDOWN (в т.ч. для прокрутки)
+        # Глобальный key-repeat намеренно НЕ включаем: он повторял бы и Enter,
+        # что при удержании кнопки приводило к каскаду лишних отправок формы
+        # (пустой ввод трактуется многими меню как "0"/"назад"). Повтор нужен
+        # только для стрелок прокрутки — реализован вручную в update().
         pygame.display.set_caption("ROBCO INDUSTRIES (TM) TERMLINK")
         self.window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.render_surface = pygame.Surface((RENDER_W, RENDER_H))
@@ -303,6 +297,14 @@ class TerminalApp:
         self.cursor_visible = True
         self.cursor_timer = 0.0
 
+        # Ручной повтор для удержания стрелок вверх/вниз (см. update())
+        self._scroll_hold_start = None
+        self._scroll_next_repeat_at = 0.0
+        SCROLL_REPEAT_DELAY = 0.4   # пауза перед началом автоповтора (сек)
+        SCROLL_REPEAT_INTERVAL = 0.04  # интервал между повторами (сек)
+        self._scroll_repeat_delay = SCROLL_REPEAT_DELAY
+        self._scroll_repeat_interval = SCROLL_REPEAT_INTERVAL
+
         self.scanlines = make_scanlines(RENDER_W, RENDER_H)
         self.vignette = make_vignette(RENDER_W, RENDER_H)
 
@@ -313,6 +315,9 @@ class TerminalApp:
         self.new_log_lines = []
         self.chat_history_entries = []
         self.chat_transcript = []
+        self.main_menu_actions = []
+        self.data_entries = []
+        self.current_data_category = None
 
         # Авторизация
         self.password_attempts_used = 0
@@ -467,19 +472,73 @@ class TerminalApp:
         self.state = self.STATE_MAIN_MENU
         self.fixed_header = True
         self.output.clear()
-        self.output.push(
-            "[1. Журнал                 ]\n"
-            "[2. Хозяйственные отчёты   ]\n"
-            "[3. Отчёты по безопасности ]\n"
-            "[4. Отчёты по счастью      ]\n"
-            "[5. Управление дверьми     ]\n"
-            "[6. Чат со S.C.O.P.E.      ]\n"
-            "[0. Закрыть терминал       ]\n"
-        )
+
+        actions = [("Журнал", self._enter_log_list)]
+        if ENABLE_DOOR_CONTROL:
+            actions.append(("Управление дверьми", self._enter_door_control))
+        if ENABLE_CHAT:
+            actions.append(("Чат со S.C.O.P.E.", self._enter_chat_menu))
+        for category in self._list_data_categories():
+            actions.append((category, lambda c=category: self._enter_data_category(c)))
+        self.main_menu_actions = actions
+
+        items = [(str(i), label) for i, (label, _) in enumerate(actions, 1)]
+        items.append(("0", "Закрыть терминал"))
+        self.output.push(self._format_menu_lines(items) + "\n")
+
+    def _list_data_categories(self):
+        try:
+            entries = [
+                d for d in os.listdir(DATA_DIR)
+                if os.path.isdir(os.path.join(DATA_DIR, d))
+            ]
+            entries.sort()
+        except FileNotFoundError:
+            entries = []
+        return entries
+
+    def _list_data_entries(self, category):
+        folder = os.path.join(DATA_DIR, category)
+        try:
+            entries = [f for f in os.listdir(folder) if f.lower().endswith(".md")]
+            entries.sort()
+        except FileNotFoundError:
+            entries = []
+        return entries
+
+    def _enter_data_category(self, category):
+        self.state = self.STATE_DATA_LIST
+        self.fixed_header = True
+        self.output.clear()
+        self.current_data_category = category
+        self.data_entries = self._list_data_entries(category)
+        if not self.data_entries:
+            items = [("0", "Назад")]
+            self.output.push(
+                f"\n==={category}===\n\nВ этом разделе пока нет записей.\n\n"
+                + self._format_menu_lines(items) + "\n"
+            )
+            return
+        items = [(str(i), os.path.splitext(entry)[0]) for i, entry in enumerate(self.data_entries, 1)]
+        items.append(("0", "Назад"))
+        text = f"\n==={category}===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
+
+    def _open_data_entry(self, filename):
+        self.state = self.STATE_DATA_VIEW
+        self.fixed_header = True
+        self.output.clear()
+        path = os.path.join(DATA_DIR, self.current_data_category, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.output.push(f"\n[{filename}]\n\n{content}\n\n[Нажмите Enter, чтобы вернуться...]")
+        except FileNotFoundError:
+            self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
 
     def _list_log_entries(self):
         try:
-            entries = [f for f in os.listdir(FOREMANS_LOG_DIR) if f.lower().endswith(".md")]
+            entries = [f for f in os.listdir(JOURNAL_DIR) if f.lower().endswith(".md")]
             entries.sort()
         except FileNotFoundError:
             entries = []
@@ -490,18 +549,31 @@ class TerminalApp:
         self.fixed_header = True
         self.output.clear()
         self.log_entries = self._list_log_entries()
-        text = "\n===Журнал===\n"
-        for i, entry in enumerate(self.log_entries, 1):
-            text += f"\n [{i}. {os.path.splitext(entry)[0]}]"
-        text += f"\n [{len(self.log_entries) + 1}. Создать новую запись]"
-        text += "\n\n [0. В Главное Меню]\n"
+        if not self.log_entries:
+            items = [("1", "Создать запись"), ("0", "В Главное Меню")]
+            self.output.push(
+                "\nЗаписей в журнале нет.\n\n" + self._format_menu_lines(items) + "\n"
+            )
+            return
+        items = [(str(i), os.path.splitext(entry)[0]) for i, entry in enumerate(self.log_entries, 1)]
+        items.append((str(len(self.log_entries) + 1), "Создать новую запись"))
+        items.append(("0", "В Главное Меню"))
+        text = "\n===Журнал===\n\n" + self._format_menu_lines(items) + "\n"
         self.output.push(text)
+
+    def _start_new_log_entry(self):
+        self.state = self.STATE_LOG_NEW
+        self.fixed_header = True
+        self.output.clear()
+        self.new_log_lines = []
+        self._new_log_title = None
+        self.output.push("\n=== Создать новую запись ===\nЗаголовок:")
 
     def _open_log_entry(self, filename):
         self.state = self.STATE_LOG_VIEW
         self.fixed_header = True
         self.output.clear()
-        path = os.path.join(FOREMANS_LOG_DIR, filename)
+        path = os.path.join(JOURNAL_DIR, filename)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -514,8 +586,8 @@ class TerminalApp:
         if not safe_title:
             safe_title = "untitled"
         filename = f"{safe_title}.md"
-        os.makedirs(FOREMANS_LOG_DIR, exist_ok=True)
-        filepath = os.path.join(FOREMANS_LOG_DIR, filename)
+        os.makedirs(JOURNAL_DIR, exist_ok=True)
+        filepath = os.path.join(JOURNAL_DIR, filename)
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -529,13 +601,13 @@ class TerminalApp:
         self.state = self.STATE_DOOR
         self.fixed_header = True
         self.output.clear()
-        self.output.push(
+        items = [("1", "Открыть дверь"), ("2", "Закрыть дверь"), ("0", "В Главное Меню")]
+        text = (
             "\n===Интерфейс контроля защищённых дверей MaxLock===\n"
             f"СТАТУС: {self.door_status}\n\n"
-            "[1. Открыть дверь ]\n"
-            "[2. Закрыть дверь ]\n"
-            "[0. В Главное Меню]\n"
+            + self._format_menu_lines(items) + "\n"
         )
+        self.output.push(text)
 
     # -------------------------------------------------------------- чат-ИИ
     MQTT_CONNECT_GRACE_SECONDS = 3.0
@@ -544,12 +616,9 @@ class TerminalApp:
         self.state = self.STATE_CHAT_MENU
         self.fixed_header = True
         self.output.clear()
-        self.output.push(
-            "\n===Чат со S.C.O.P.E.===\n\n"
-            "[1. История чатов ]\n"
-            "[2. Новый чат     ]\n"
-            "[0. В Главное Меню]\n"
-        )
+        items = [("1", "История чатов"), ("2", "Новый чат"), ("0", "В Главное Меню")]
+        text = "\n===Чат со S.C.O.P.E.===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
 
     def _list_chat_history_entries(self):
         try:
@@ -565,12 +634,14 @@ class TerminalApp:
         self.output.clear()
         self.chat_history_entries = self._list_chat_history_entries()
         if not self.chat_history_entries:
-            self.output.push("\n===История чатов===\n\nИстория чата пуста.\n\n[0. Назад]\n")
+            items = [("0", "Назад")]
+            self.output.push(
+                "\n===История чатов===\n\nИстория чата пуста.\n\n" + self._format_menu_lines(items) + "\n"
+            )
             return
-        text = "\n===История чатов===\n"
-        for i, entry in enumerate(self.chat_history_entries, 1):
-            text += f"\n [{i}. {os.path.splitext(entry)[0]}]"
-        text += "\n\n [0. Назад]\n"
+        items = [(str(i), os.path.splitext(entry)[0]) for i, entry in enumerate(self.chat_history_entries, 1)]
+        items.append(("0", "Назад"))
+        text = "\n===История чатов===\n\n" + self._format_menu_lines(items) + "\n"
         self.output.push(text)
 
     def _open_chat_history_entry(self, filename):
@@ -745,12 +816,15 @@ class TerminalApp:
             self._handle_main_menu(text)
             return
 
-        if self.state == self.STATE_FINANCIAL or self.state == self.STATE_SAFETY:
-            self._enter_main_menu()
-            return
-
         if self.state == self.STATE_LOG_LIST:
             self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            if not self.log_entries:
+                # Пустой журнал: 1 — создать запись, 0 — назад в главное меню
+                if text == "1":
+                    self._start_new_log_entry()
+                elif text == "0" or text == "":
+                    self._enter_main_menu()
+                return
             if text == "0" or text == "":
                 self._enter_main_menu()
             elif text.isdigit():
@@ -758,13 +832,7 @@ class TerminalApp:
                 if 1 <= choice <= len(self.log_entries):
                     self._open_log_entry(self.log_entries[choice - 1])
                 elif choice == len(self.log_entries) + 1:
-                    self.state = self.STATE_LOG_NEW
-                    self.fixed_header = True
-                    self.output.clear()
-                    self.new_log_lines = []
-                    self.output.push(
-                        "\n=== Создать новую запись ===\nЗаголовок:"
-                    )
+                    self._start_new_log_entry()
             return
 
         if self.state == self.STATE_LOG_VIEW:
@@ -774,6 +842,20 @@ class TerminalApp:
         if self.state == self.STATE_LOG_NEW:
             self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             self._handle_log_new_input(text)
+            return
+
+        if self.state == self.STATE_DATA_LIST:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            if text == "0" or text == "":
+                self._enter_main_menu()
+            elif text.isdigit():
+                choice = int(text)
+                if 1 <= choice <= len(self.data_entries):
+                    self._open_data_entry(self.data_entries[choice - 1])
+            return
+
+        if self.state == self.STATE_DATA_VIEW:
+            self._enter_data_category(self.current_data_category)
             return
 
         if self.state == self.STATE_DOOR:
@@ -828,31 +910,13 @@ class TerminalApp:
             return
 
     def _handle_main_menu(self, text):
-        if text == "1":
-            self._enter_log_list()
-        elif text == "2":
-            self.state = self.STATE_FINANCIAL
-            self.fixed_header = True
-            self.output.clear()
-            self.output.push("\n" + FINANCIAL_REPORT_TEXT + "\n\n[Нажмите Enter, чтобы вернуться...]")
-        elif text == "3":
-            self.state = self.STATE_SAFETY
-            self.fixed_header = True
-            self.output.clear()
-            self.output.push("\n" + SAFETY_REPORT_TEXT + "\n\n[Нажмите Enter, чтобы вернуться...]")
-        elif text == "4":
-            self.state = self.STATE_SAFETY
-            self.fixed_header = True
-            self.output.clear()
-            self.output.push("\n" + SAFETY_REPORT_TEXT + "\n\n[Нажмите Enter, чтобы вернуться...]")
-        elif text == "5":
-            self._enter_door_control()
-        elif text == "6":
-            self._enter_chat_menu()
-        elif text == "0":
+        if text == "0":
             self.state = self.STATE_CLOSING
             self.output.push("\nЗавершение сеанса...\nВыключение...\n")
             self._schedule(MENU_CLOSE_DELAY_SECONDS, self._quit)
+        elif text.isdigit() and 1 <= int(text) <= len(self.main_menu_actions):
+            _, action = self.main_menu_actions[int(text) - 1]
+            action()
         else:
             self._play("error")
             self.output.push("\nНеизвестная команда.\n", instant=True)
@@ -907,6 +971,13 @@ class TerminalApp:
                 self._play("clack")
                 self.input_text += event.unicode
 
+    def _format_menu_lines(self, items):
+        """items — список (номер_как_строка, подпись). Пункт '0' обычно
+        передаётся последним. Закрывающие скобки выравниваются пробелами
+        по самому длинному пункту в этом конкретном меню."""
+        max_w = max(len(f"{num}. {label}") for num, label in items)
+        return "\n".join(f"[{f'{num}. {label}'.ljust(max_w)}]" for num, label in items)
+
     def _current_max_lines(self):
         return self.max_visible_lines_header if self.fixed_header else self.max_visible_lines_full
 
@@ -932,6 +1003,7 @@ class TerminalApp:
         self._sync_typing_loop(self.output.is_typing())
         self._poll_chat_incoming()
         self._poll_chat_status()
+        self._update_scroll_repeat()
         self.cursor_timer += dt
         if self.cursor_timer > 0.5:
             self.cursor_timer = 0.0
@@ -942,6 +1014,30 @@ class TerminalApp:
             self._pending_callback = None
             self._pending_callback_at = None
             callback()
+
+    def _update_scroll_repeat(self):
+        """Повтор прокрутки при удержании стрелок — реализован вручную,
+        не через глобальный pygame.key.set_repeat(), чтобы не задевать Enter."""
+        keys = pygame.key.get_pressed()
+        held_up = keys[pygame.K_UP]
+        held_down = keys[pygame.K_DOWN]
+
+        if not (held_up or held_down):
+            self._scroll_hold_start = None
+            return
+
+        now = time.time()
+        if self._scroll_hold_start is None:
+            # Момент нажатия уже обработан в handle_event — здесь только
+            # отслеживаем длительность удержания для последующего автоповтора.
+            self._scroll_hold_start = now
+            self._scroll_next_repeat_at = now + self._scroll_repeat_delay
+            return
+
+        if now - self._scroll_hold_start >= self._scroll_repeat_delay and now >= self._scroll_next_repeat_at:
+            direction = SCROLL_STEP if held_up else -SCROLL_STEP
+            self.output.scroll(direction, self._current_max_lines())
+            self._scroll_next_repeat_at = now + self._scroll_repeat_interval
 
     def _render_splash(self, surf):
         if self.splash_image is not None:
