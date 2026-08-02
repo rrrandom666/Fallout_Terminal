@@ -74,7 +74,7 @@ VIGNETTE_ALPHA_MAX = 90
 TYPEWRITER_CHARS_PER_FRAME = 2
 SCROLL_STEP = 3  # строк за одно нажатие/повтор стрелки
 
-# --- Легко менять при необходимости --------------------------------------
+# --- Всякоразные переменные --------------------------------------
 MAX_PASSWORD_ATTEMPTS = 4
 CORRECT_PASSWORD = "HAPPINESS"
 AUTH_SUCCESS_DELAY_SECONDS = 2.5   # после верного пароля, перед главным меню
@@ -100,6 +100,7 @@ HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n")) + 1  # +1 — строка с
 HEADER_GAP_LINES = 1  # пустая строка-отступ между шапкой и прокручиваемым текстом
 
 FOREMANS_LOG_DIR = os.path.join("FalloutDocuments", "Foreman's Log")
+CHAT_HISTORY_DIR = "chat_history"
 
 # Звуки
 SOUND_DIR = "media"
@@ -267,7 +268,11 @@ class TerminalApp:
     STATE_LOG_VIEW = "LOG_VIEW"
     STATE_LOG_NEW = "LOG_NEW"
     STATE_DOOR = "DOOR"
+    STATE_CHAT_MENU = "CHAT_MENU"
+    STATE_CHAT_HISTORY_LIST = "CHAT_HISTORY_LIST"
+    STATE_CHAT_HISTORY_VIEW = "CHAT_HISTORY_VIEW"
     STATE_CHAT = "CHAT"
+    STATE_CHAT_SAVED = "CHAT_SAVED"
 
     def __init__(self):
         pygame.init()
@@ -306,6 +311,8 @@ class TerminalApp:
         self.door_status = "ЗАКРЫТА"
         self.log_entries = []
         self.new_log_lines = []
+        self.chat_history_entries = []
+        self.chat_transcript = []
 
         # Авторизация
         self.password_attempts_used = 0
@@ -434,10 +441,10 @@ class TerminalApp:
         self.fixed_header = True
         self.output.push(
             "Добро пожаловать в терминальную сеть ROBCO Industries (TM)\n"
-            "-----------------\n"
-            "Инициализация...\n"
-            "[Загрузка системы...]\n"
-            "[Запуск протоколов...]\n"
+            "-------------------------------\n"
+            "[Инициализация...             ]\n"
+            "[Загрузка системы...          ]\n"
+            "[Запуск протоколов...         ]\n"
             "[Подключение к базам данных...]\n"
             "ПОДКЛЮЧЕНО\n"
         )
@@ -483,7 +490,7 @@ class TerminalApp:
         self.fixed_header = True
         self.output.clear()
         self.log_entries = self._list_log_entries()
-        text = "\n[Журнал]\n"
+        text = "\n===Журнал===\n"
         for i, entry in enumerate(self.log_entries, 1):
             text += f"\n [{i}. {os.path.splitext(entry)[0]}]"
         text += f"\n [{len(self.log_entries) + 1}. Создать новую запись]"
@@ -523,17 +530,88 @@ class TerminalApp:
         self.fixed_header = True
         self.output.clear()
         self.output.push(
-            "\n[Интерфейс контроля защищённых дверей MaxLock]\n"
+            "\n===Интерфейс контроля защищённых дверей MaxLock===\n"
             f"СТАТУС: {self.door_status}\n\n"
             "[1. Открыть дверь ]\n"
-            "[2. Закрыть дверь]\n"
+            "[2. Закрыть дверь ]\n"
             "[0. В Главное Меню]\n"
         )
 
     # -------------------------------------------------------------- чат-ИИ
     MQTT_CONNECT_GRACE_SECONDS = 3.0
 
+    def _enter_chat_menu(self):
+        self.state = self.STATE_CHAT_MENU
+        self.fixed_header = True
+        self.output.clear()
+        self.output.push(
+            "\n===Чат со S.C.O.P.E.===\n\n"
+            "[1. История чатов ]\n"
+            "[2. Новый чат     ]\n"
+            "[0. В Главное Меню]\n"
+        )
+
+    def _list_chat_history_entries(self):
+        try:
+            entries = [f for f in os.listdir(CHAT_HISTORY_DIR) if f.lower().endswith(".md")]
+            entries.sort(reverse=True)  # свежие сеансы сверху
+        except FileNotFoundError:
+            entries = []
+        return entries
+
+    def _enter_chat_history_list(self):
+        self.state = self.STATE_CHAT_HISTORY_LIST
+        self.fixed_header = True
+        self.output.clear()
+        self.chat_history_entries = self._list_chat_history_entries()
+        if not self.chat_history_entries:
+            self.output.push("\n===История чатов===\n\nИстория чата пуста.\n\n[0. Назад]\n")
+            return
+        text = "\n===История чатов===\n"
+        for i, entry in enumerate(self.chat_history_entries, 1):
+            text += f"\n [{i}. {os.path.splitext(entry)[0]}]"
+        text += "\n\n [0. Назад]\n"
+        self.output.push(text)
+
+    def _open_chat_history_entry(self, filename):
+        self.state = self.STATE_CHAT_HISTORY_VIEW
+        self.fixed_header = True
+        self.output.clear()
+        path = os.path.join(CHAT_HISTORY_DIR, filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.output.push(f"\n[{filename}]\n\n{content}\n\n[Нажмите Enter, чтобы вернуться...]")
+        except FileNotFoundError:
+            self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
+
+    def _save_chat_history(self):
+        self.state = self.STATE_CHAT_SAVED
+        if not self.chat_transcript:
+            self.output.push(
+                "\n[Сеанс завершён без сообщений]\n\n"
+                "[Нажмите Enter, чтобы вернуться...]"
+            )
+            return
+        now = datetime.datetime.now(TIMEZONE_GMT3)
+        filename = f"{GAME_YEAR:04d}-{now.month:02d}-{now.day:02d}_{now.hour:02d}-{now.minute:02d}-{now.second:02d}.md"
+        os.makedirs(CHAT_HISTORY_DIR, exist_ok=True)
+        filepath = os.path.join(CHAT_HISTORY_DIR, filename)
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write("\n\n".join(self.chat_transcript) + "\n")
+            self._play("complete")
+            self.output.push(
+                f"\nИстория чата сохранена в {filename}.\n\n[Нажмите Enter, чтобы вернуться...]"
+            )
+        except OSError as e:
+            self._play("error")
+            self.output.push(
+                f"\nОшибка сохранения истории чата: {e}\n\n[Нажмите Enter, чтобы вернуться...]"
+            )
+
     def _enter_chat(self):
+        self.chat_transcript = []
         self.state = self.STATE_CHAT
         self.fixed_header = True
         self.output.clear()
@@ -616,6 +694,7 @@ class TerminalApp:
 
     def _send_chat_message(self, text):
         self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+        self.chat_transcript.append(f"**{self.current_user}:** {text}")
         if self.mqtt_connected and self.mqtt_client is not None:
             try:
                 self.mqtt_client.publish(TOPIC_TO_MASTER, text, qos=1)
@@ -630,6 +709,7 @@ class TerminalApp:
         while not self.incoming_queue.empty():
             text = self.incoming_queue.get()
             self.output.push(f"[S.C.O.P.E.]: {text}\n")
+            self.chat_transcript.append(f"**S.C.O.P.E.:** {text}")
 
     # -------------------------------------------------------------- ввод
     def handle_submit(self, raw_text):
@@ -710,12 +790,41 @@ class TerminalApp:
                 self._enter_main_menu()
             return
 
+        if self.state == self.STATE_CHAT_MENU:
+            if text == "1":
+                self._enter_chat_history_list()
+            elif text == "2":
+                self._enter_chat()
+            elif text == "0" or text == "":
+                self._enter_main_menu()
+            else:
+                self._play("error")
+                self.output.push("\nНеизвестная команда.\n")
+            return
+
+        if self.state == self.STATE_CHAT_HISTORY_LIST:
+            if text == "0" or text == "":
+                self._enter_chat_menu()
+            elif text.isdigit():
+                choice = int(text)
+                if 1 <= choice <= len(self.chat_history_entries):
+                    self._open_chat_history_entry(self.chat_history_entries[choice - 1])
+            return
+
+        if self.state == self.STATE_CHAT_HISTORY_VIEW:
+            self._enter_chat_history_list()
+            return
+
         if self.state == self.STATE_CHAT:
             if text.lower() == "exit":
                 self._mqtt_disconnect()
-                self._enter_main_menu()
+                self._save_chat_history()
             elif text:
                 self._send_chat_message(text)
+            return
+
+        if self.state == self.STATE_CHAT_SAVED:
+            self._enter_chat_menu()
             return
 
     def _handle_main_menu(self, text):
@@ -739,7 +848,7 @@ class TerminalApp:
         elif text == "5":
             self._enter_door_control()
         elif text == "6":
-            self._enter_chat()
+            self._enter_chat_menu()
         elif text == "0":
             self.state = self.STATE_CLOSING
             self.output.push("\nЗавершение сеанса...\nВыключение...\n")
