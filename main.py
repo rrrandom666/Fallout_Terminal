@@ -30,6 +30,18 @@ import random
 import pygame
 
 # --------------------------------------------------------------------------
+# Опциональный psutil (определение подключённой флешки с модулем взлома).
+# Если библиотеки нет — автоопределение просто выключено, остаётся
+# резервный ручной триггер (см. HACK_MODULE_TRIGGER_PASSWORD).
+# --------------------------------------------------------------------------
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
+
+# --------------------------------------------------------------------------
 # Опциональный MQTT (чат с мастером). Если библиотеки нет или брокер
 # недоступен — приложение не падает, а работает в локальном тестовом
 # режиме (эхо ответов), чтобы можно было разрабатывать/тестировать без
@@ -78,6 +90,36 @@ SCROLL_STEP = 3  # строк за одно нажатие/повтор стре
 MAX_PASSWORD_ATTEMPTS = 4
 CORRECT_PASSWORD = "HAPPINESS"
 AUTH_SUCCESS_DELAY_SECONDS = 2.5   # после верного пароля, перед главным меню
+
+# --------------------------------------------------------------------------
+# Определение подключённых флешек — общий механизм, не привязанный к
+# конкретному модулю. Опрос дисков идёт постоянно (не только на экране
+# пароля); что делать с новым диском — решает уже конкретный обработчик
+# (см. _check_hack_module_on_drives). Так проще добавить другие сценарии
+# чтения флешки позже, без завязки на файл-маркер.
+# --------------------------------------------------------------------------
+DRIVE_POLL_INTERVAL = 1.0  # как часто проверять список смонтированных дисков (сек)
+
+# --------------------------------------------------------------------------
+# Модуль взлома пароля — НЕ часть штатного интерфейса системы авторизации.
+# Активируется только когда во время экрана пароля к компьютеру
+# подключается флешка (голодиск-эксплойт) с файлом-маркером на борту.
+# Попытки взлома тратят тот же лимит, что и обычный ввод пароля — с точки
+# зрения системы это ровно то же самое "неверная попытка авторизации".
+# --------------------------------------------------------------------------
+ENABLE_HACK_MODULE_DETECTION = True         # реагировать ли на маркер флешки
+HACK_MODULE_MARKER_FILENAME = "robco_hack.module"  # файл-маркер в корне флешки
+
+# Резервный ручной запуск — если реальной флешки нет под рукой (тест, показ),
+# либо это способ, которым голодиск-HID сам "впечатывает" триггер в поле пароля.
+HACK_MODULE_TRIGGER_PASSWORD = "ICEBREAKER"
+
+HACK_WORD_POOL = [
+    "ВОЙНА", "ГОРОД", "ОГОНЬ", "БРОНЯ", "ВОЛНА", "ЩЕПКА", "ПАТРОН", "БУНКЕР",
+    "МЕТАЛЛ", "МУТАНТ", "РЕАКТОР", "ПУСТОШЬ", "ОСКОЛОК", "ГЕЙГЕР", "ОБЛОМОК",
+    "КИСЛОТА", "РАДИАЦИЯ", "УБЕЖИЩЕ", "СКАФАНДР",
+]
+HACK_CANDIDATES_COUNT = 6
 LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
 MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
 GAME_YEAR = 2276                       
@@ -250,6 +292,7 @@ class TerminalApp:
     STATE_SPLASH = "SPLASH"
     STATE_BOOT = "BOOT"
     STATE_PASSWORD = "PASSWORD"
+    STATE_HACK_MINIGAME = "HACK_MINIGAME"
     STATE_AUTH_SUCCESS = "AUTH_SUCCESS"
     STATE_CLOSING = "CLOSING"
     STATE_MAIN_MENU = "MAIN_MENU"
@@ -322,6 +365,20 @@ class TerminalApp:
         # Авторизация
         self.password_attempts_used = 0
         self.current_user = UNAUTHORIZED_USER_LABEL
+
+        # Модуль взлома (запускается только с внешней флешки; попытки —
+        # общие с обычным вводом пароля, self.password_attempts_used)
+        self.hack_candidates = []
+        self.hack_answer = ""
+
+        # Определение флешек — общий механизм (см. константы выше)
+        self._last_drive_poll_at = 0.0
+        self._known_mount_points = set()
+        if PSUTIL_AVAILABLE:
+            try:
+                self._known_mount_points = {p.mountpoint for p in psutil.disk_partitions(all=False)}
+            except Exception:
+                self._known_mount_points = set()
 
         # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
         self._pending_callback = None
@@ -467,6 +524,64 @@ class TerminalApp:
             text = "ТРЕБУЕТСЯ ПАРОЛЬ\n"
         text += f"Осталось попыток: {attempts_left}\nВведите пароль:\n"
         self.output.push(text)
+
+    # ------------------------------------------------------ флешки (общее)
+    def _poll_removable_drives(self):
+        """Чисто техническое обнаружение новых смонтированных дисков — не
+        привязано к экрану пароля и ничего не знает про маркеры/модули.
+        Возвращает список путей монтирования, появившихся с прошлого опроса
+        (пустой список, если опрос ещё не пора делать или ничего нового)."""
+        if not PSUTIL_AVAILABLE:
+            return []
+        now = time.time()
+        if now - self._last_drive_poll_at < DRIVE_POLL_INTERVAL:
+            return []
+        self._last_drive_poll_at = now
+        try:
+            current_mounts = {p.mountpoint for p in psutil.disk_partitions(all=False)}
+        except Exception:
+            return []
+        new_mounts = current_mounts - self._known_mount_points
+        self._known_mount_points = current_mounts
+        return sorted(new_mounts)
+
+    # ------------------------------------------------------- модуль взлома
+    def _check_hack_module_on_drives(self, new_mounts):
+        """Реагирует на новые диски, только если терминал сейчас на экране
+        пароля. Само приложение не предлагает этот путь пользователю — оно
+        лишь честно замечает физическое вторжение постороннего устройства."""
+        if not ENABLE_HACK_MODULE_DETECTION or self.state != self.STATE_PASSWORD:
+            return
+        for mount in new_mounts:
+            marker_path = os.path.join(mount, HACK_MODULE_MARKER_FILENAME)
+            if os.path.isfile(marker_path):
+                self._launch_hack_module()
+                return
+
+    def _launch_hack_module(self):
+        pool_by_length = {}
+        for word in HACK_WORD_POOL:
+            pool_by_length.setdefault(len(word), []).append(word)
+        eligible = [words for words in pool_by_length.values() if len(words) >= 4]
+        words = random.choice(eligible)
+        count = min(HACK_CANDIDATES_COUNT, len(words))
+        self.hack_candidates = random.sample(words, count)
+        self.hack_answer = random.choice(self.hack_candidates)
+        self._render_hack_screen(intro=True)
+
+    def _render_hack_screen(self, intro=False, feedback=None):
+        self.state = self.STATE_HACK_MINIGAME
+        attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
+        lines = []
+        if intro:
+            lines.append("ОБНАРУЖЕНО ПОСТОРОННЕЕ УСТРОЙСТВО.")
+            lines.append("Запущен несанкционированный модуль взлома пароля.\n")
+        if feedback:
+            lines.append(feedback + "\n")
+        lines.append(f"Попыток: {attempts_left}\n")
+        items = [(str(i), w) for i, w in enumerate(self.hack_candidates, 1)]
+        lines.append(self._format_menu_lines(items))
+        self.output.push("\n".join(lines))
 
     def _enter_main_menu(self):
         self.state = self.STATE_MAIN_MENU
@@ -787,6 +902,11 @@ class TerminalApp:
         text = raw_text.strip()
 
         if self.state == self.STATE_PASSWORD:
+            if text.upper() == HACK_MODULE_TRIGGER_PASSWORD:
+                # Резервный ручной запуск — не является штатным пунктом
+                # авторизации, см. комментарий у константы выше.
+                self._launch_hack_module()
+                return
             if text.upper() == CORRECT_PASSWORD:
                 self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
                 self._play("unlocked")
@@ -806,6 +926,36 @@ class TerminalApp:
                 self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
                 self._play("error")
                 self._enter_password(extra_message="НЕВЕРНЫЙ ПАРОЛЬ")
+            return
+
+        if self.state == self.STATE_HACK_MINIGAME:
+            if text.isdigit():
+                idx = int(text)
+                if 1 <= idx <= len(self.hack_candidates):
+                    guess = self.hack_candidates[idx - 1]
+                    if guess == self.hack_answer:
+                        self._play("unlocked")
+                        self.current_user = AUTHORIZED_USER_LABEL
+                        self.state = self.STATE_AUTH_SUCCESS
+                        self.output.push(
+                            "\nВЗЛОМ УСПЕШЕН.\nПАРОЛЬ ПОДОБРАН.\n"
+                            f"Вы авторизованы как: {self.current_user}\n",
+                            instant=True,
+                        )
+                        self._schedule(AUTH_SUCCESS_DELAY_SECONDS, self._enter_main_menu)
+                        return
+                    matches = sum(1 for a, b in zip(guess, self.hack_answer) if a == b)
+                    self.password_attempts_used += 1
+                    attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
+                    self._play("error")
+                    if attempts_left <= 0:
+                        self.state = self.STATE_CLOSING
+                        self.output.push("\nДОСТУП ЗАПРЕЩЁН\nВыключение...\n", instant=True)
+                        self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
+                    else:
+                        self._render_hack_screen(
+                            feedback=f"НЕВЕРНО. Совпадений: {matches}/{len(self.hack_answer)}."
+                        )
             return
 
         if self.state in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
@@ -1003,6 +1153,11 @@ class TerminalApp:
         self._sync_typing_loop(self.output.is_typing())
         self._poll_chat_incoming()
         self._poll_chat_status()
+        new_mounts = self._poll_removable_drives()
+        if new_mounts:
+            self._check_hack_module_on_drives(new_mounts)
+            # Сюда же в будущем можно добавить другие обработчики новых
+            # дисков — например, чтение содержимого голодиска без маркера.
         self._update_scroll_repeat()
         self.cursor_timer += dt
         if self.cursor_timer > 0.5:
