@@ -26,6 +26,7 @@ import time
 import queue
 import datetime
 import random
+import re
 
 import pygame
 
@@ -114,12 +115,6 @@ HACK_MODULE_MARKER_FILENAME = "robco_hack.module"  # файл-маркер в к
 # либо это способ, которым голодиск-HID сам "впечатывает" триггер в поле пароля.
 HACK_MODULE_TRIGGER_PASSWORD = "ICEBREAKER"
 
-HACK_WORD_POOL = [
-    "ВОЙНА", "ГОРОД", "ОГОНЬ", "БРОНЯ", "ВОЛНА", "ЩЕПКА", "ПАТРОН", "БУНКЕР",
-    "МЕТАЛЛ", "МУТАНТ", "РЕАКТОР", "ПУСТОШЬ", "ОСКОЛОК", "ГЕЙГЕР", "ОБЛОМОК",
-    "КИСЛОТА", "РАДИАЦИЯ", "УБЕЖИЩЕ", "СКАФАНДР",
-]
-HACK_CANDIDATES_COUNT = 6
 LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
 MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
 GAME_YEAR = 2276                       
@@ -174,10 +169,33 @@ SPLASH_HOLD_AT_100 = 0.6     # пауза на 100%, прежде чем пер�
 SPLASH_BAR_WIDTH = 420
 SPLASH_BAR_HEIGHT = 22
 
+# =========================================================================
+# Функции для мини-игры взлома
+# =========================================================================
 
-# --------------------------------------------------------------------------
+def calculate_positional_matches(guess, correct):
+    """Подсчёт совпадений букв по позиции (как в классическом Fallout)."""
+    guess = guess.upper()
+    correct = correct.upper()
+    matches = 0
+    for i in range(min(len(guess), len(correct))):
+        if guess[i] == correct[i]:
+            matches += 1
+    return matches
+
+WORD_BANK = [
+    "CONSIST", "ROAMING", "GAINING", "FARMING", "STERILE", "ENGLISH",
+    "FENCING", "MANKIND", "MORNING", "HEALING", "LEAVING", "CORRECT",
+    "JESSICA", "CONTACT", "NUCLEAR", "SCIENCE", "CONTROL", "FALLOUT",
+    "DISABLE", "UPGRADE", "SYSTEMS", "NETWORK", "PROCESS", "PROGRAM",
+    "DIGITAL", "MACHINE", "KEYCARD", "SCANNER", "CHAMBER", "REACTOR",
+    "TESTING", "HUNTING", "COOKING", "WALKING", "SITTING", "TALKING",
+    "WRITING", "READING", "WORKING", "PLAYING", "WINNING", "RUNNING"
+]
+
+# =========================================================================
 # Визуальные эффекты
-# --------------------------------------------------------------------------
+# =========================================================================
 def make_bloom(surface):
     """Дешёвый bloom через downscale -> upscale со сглаживанием."""
     w, h = surface.get_size()
@@ -368,8 +386,15 @@ class TerminalApp:
 
         # Модуль взлома (запускается только с внешней флешки; попытки —
         # общие с обычным вводом пароля, self.password_attempts_used)
-        self.hack_candidates = []
-        self.hack_answer = ""
+        self.hack_correct_password = ""
+        self.hack_display = []
+        self.hack_bonus_codes = []
+        self.hack_all_content = []
+        self.hack_attempts = 0
+        self.hack_guess_history = []
+        self.hack_state = "INACTIVE"  # INACTIVE, ACTIVE, SUCCESS, FAILED
+        self.hack_initial_render = True
+        self.hack_restore_smiley = ""  # Какой смайл восстанавливает попытку
 
         # Определение флешек — общий механизм (см. константы выше)
         self._last_drive_poll_at = 0.0
@@ -517,12 +542,13 @@ class TerminalApp:
 
     def _enter_password(self, extra_message=None):
         self.state = self.STATE_PASSWORD
+        self.fixed_header = True
         attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
         if extra_message:
             text = f"{extra_message}\n"
         else:
-            text = "ТРЕБУЕТСЯ ПАРОЛЬ\n"
-        text += f"Осталось попыток: {attempts_left}\nВведите пароль:\n"
+            text = "ВВЕДИТЕ ПАРОЛЬ\n"
+        text += f"ПОПЫТОК ОСТАЛОСЬ: " + "■ " * attempts_left + "\nВведите пароль:\n"
         self.output.push(text)
 
     # ------------------------------------------------------ флешки (общее)
@@ -555,33 +581,259 @@ class TerminalApp:
         for mount in new_mounts:
             marker_path = os.path.join(mount, HACK_MODULE_MARKER_FILENAME)
             if os.path.isfile(marker_path):
-                self._launch_hack_module()
+                self.output.push("Запускаю режим взлома пароля с внешнего носителя...\n", instant=True)
+                self._schedule(LOCKOUT_DELAY_SECONDS, self._launch_hack_module)
                 return
 
     def _launch_hack_module(self):
-        pool_by_length = {}
-        for word in HACK_WORD_POOL:
-            pool_by_length.setdefault(len(word), []).append(word)
-        eligible = [words for words in pool_by_length.values() if len(words) >= 4]
-        words = random.choice(eligible)
-        count = min(HACK_CANDIDATES_COUNT, len(words))
-        self.hack_candidates = random.sample(words, count)
-        self.hack_answer = random.choice(self.hack_candidates)
-        self._render_hack_screen(intro=True)
+        """Запуск мини-игры взлома пароля."""
 
-    def _render_hack_screen(self, intro=False, feedback=None):
+        # Генерируем случайный пароль из WORD_BANK
+        self.hack_correct_password = random.choice(WORD_BANK)
+        
+        # Выбираем другие слова для отображения
+        others = [w for w in WORD_BANK if w != self.hack_correct_password]
+        display_passwords = random.sample(others, random.randint(5, 9)) + [self.hack_correct_password]
+        random.shuffle(display_passwords)
+        
+        # Генерируем отображение терминала
+        self.hack_display, self.hack_bonus_codes, self.hack_all_content = self._generate_hack_display(display_passwords)
+        self.hack_attempts = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
+        self.hack_guess_history = []
+        self.hack_state = "ACTIVE"
+        self.fixed_header = False
+        self.hack_initial_render = True  # Флаг для первого рендера
+        
+        self._render_hack_screen()
+
+    def _generate_hack_display(self, passwords):
+        """Генерирует отображение терминала для мини-игры взлома."""
+        display = []
+        display.append("")
+        display.append("ВВЕДИТЕ ПАРОЛЬ")
+        display.append("")
+        
+        filler_words = [
+            "LOADING", "NETWORK", "SYSTEMS", "UPGRADE", "PROCESS",
+            "CONTROL", "REACTOR", "SCANNER", "MACHINE", "DIGITAL",
+            "PROGRAM", "CHAMBER", "TESTING", "HEALTHY", "CONTACT"
+        ]
+        
+        # Очищаем список паролей
+        passwords = list(set(passwords))  # Удаляем дубликаты
+        passwords = [w for w in passwords if w != ""]  # Удаляем пустые строки
+        
+        # Берем только слова из WORD_BANK
+        correct = [w for w in passwords if w in WORD_BANK]
+        
+        # Выбираем до 16 слов для отображения
+        used_words = random.sample(correct, min(len(correct), 16))
+        
+        # Добавляем filler-слова, если нужно
+        word_count = min(16, len(used_words) + len(filler_words))
+        if len(used_words) < word_count:
+            available_fillers = [w for w in filler_words if w not in used_words]
+            needed = word_count - len(used_words)
+            used_words += random.sample(available_fillers, min(needed, len(available_fillers)))
+        
+        # Создаем контент с добавлением случайных символов
+        all_content = [("word", (w + self._generate_random_chars(12 - len(w)))[:12]) for w in used_words]
+        
+        # Бонусные смайлы
+        smileys = [":-)", ":-|", ":-0", ":-D", ":-/", "^-^", ";-)", "'0'", "0_0", ">_<", "-_-", "D_D"]
+        selected_smileys = random.sample(smileys, 4)  # Выбираем 4 случайных смайла
+
+        # Выбираем один смайл для восстановления попытки (первый из выбранных)
+        restore_smiley = selected_smileys[0]
+        
+        # Добавляем смайлы в контент
+        for smiley in selected_smileys:
+            entry = smiley + self._generate_random_chars(12 - len(smiley))
+            all_content.append(("smiley", entry[:12]))
+        
+        # Определяем активные бонусные коды (смайлы) и запоминаем, какой восстанавливает попытку
+        active_bonus_inputs = []
+        self.hack_restore_smiley = restore_smiley  # Сохраняем, какой смайл восстанавливает попытку
+        for entry in all_content:
+            if entry[0] == "smiley":
+                smiley = entry[1][:3]
+                if smiley in selected_smileys:
+                    active_bonus_inputs.append(smiley)
+        
+        # Заполняем до 32 записей случайными строками
+        def is_valid_random_string(s):
+            return all(s[i] != s[i+1] or s[i] != s[i+2] for i in range(len(s) - 2))
+        
+        while len(all_content) < 32:
+            s = self._generate_random_chars(12)
+            while not is_valid_random_string(s):
+                s = self._generate_random_chars(12)
+            all_content.append(("random", s))
+        
+        random.shuffle(all_content)
+        
+        # Формируем строки отображения
+        content_index = 0
+        for line in range(16):
+            addr1 = f"0x{0xF4F0 + line * 20:04X}"
+            addr2 = f"0x{0xF4F0 + line * 20 + 14:04X}"
+            content1 = all_content[content_index][1][:12]
+            content_index += 1
+            content2 = all_content[content_index][1][:12]
+            content_index += 1
+            display.append(f"{addr1} {content1.ljust(12)}  {addr2} {content2}")
+        
+        display.append("")
+        return display, active_bonus_inputs, all_content
+
+    def _generate_random_chars(self, length):
+        """Генерирует случайные спецсимволы."""
+        special_chars = "+#*$&)(=!?<>-_.,;:/"
+        return ''.join(random.choice(special_chars) for _ in range(length))
+
+    def _generate_new_bonus_string(self):
+        """Генерирует новую случайную строку для замены бонусного кода."""
+        special_chars = "+#*$&)(=!?<>-_.,;:/"
+        while True:
+            s = ''.join(random.choice(special_chars) for _ in range(12))
+            if all(s[i] != s[i+1] or s[i] != s[i+2] for i in range(len(s)-2)):
+                return s
+
+    def _render_hack_screen(self):
+        """Отображает экран мини-игры взлома."""
         self.state = self.STATE_HACK_MINIGAME
-        attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
-        lines = []
-        if intro:
-            lines.append("ОБНАРУЖЕНО ПОСТОРОННЕЕ УСТРОЙСТВО.")
-            lines.append("Запущен несанкционированный модуль взлома пароля.\n")
-        if feedback:
-            lines.append(feedback + "\n")
-        lines.append(f"Попыток: {attempts_left}\n")
-        items = [(str(i), w) for i, w in enumerate(self.hack_candidates, 1)]
-        lines.append(self._format_menu_lines(items))
-        self.output.push("\n".join(lines))
+        
+        # Строим строки для вывода
+        lines_to_push = []
+        
+        # Копируем базовый дисплей
+        for line in self.hack_display:
+            lines_to_push.append(line)
+        
+        # Добавляем информацию о попытках в начало
+        attempts_line = "ОСТАЛОСЬ ПОПЫТОК: " + "■ " * self.hack_attempts
+        lines_to_push.insert(2, attempts_line)
+        lines_to_push.insert(3, "")
+        
+        # Добавляем историю попыток в конец
+        for guess, match in self.hack_guess_history[-8:]:
+            lines_to_push.append("")
+            lines_to_push.append("")
+            lines_to_push.append(" " * 43 + f">{guess}")
+            if match != "":  # Для бонусов match содержит сообщение
+                lines_to_push.append(" " * 43 + f">{match}")
+            else:
+                lines_to_push.append(" " * 43 + f">Неверно")
+        
+        # Добавляем подсказку по управлению
+        lines_to_push.append("")
+        lines_to_push.append("Введите пароль:")
+        
+        # Очищаем и выводим
+        self.output.clear()
+        # При первом рендере используем instant=False, иначе instant=True
+        self.output.push("\n".join(lines_to_push), instant=not self.hack_initial_render)
+        self.hack_initial_render = False
+
+    def _try_hack_guess(self, text):
+        """Проверяет введённое слово/код."""
+        if not text:
+            return
+        
+        # Проверка на бонусный смайл
+        if text in self.hack_bonus_codes:
+            # Проверяем, является ли этот смайл тем, что восстанавливает попытку
+            is_attempt_restore = (text == self.hack_restore_smiley)
+            
+            if is_attempt_restore:
+                # Восстанавливаем попытку (но не выше 4)
+                if self.hack_attempts < 4:
+                    self.hack_attempts += 1
+                self._play("complete")
+                self.hack_guess_history.append((f"[БОНУС] {text}", "Попытка восстановлена"))
+                # После использования смайла восстановления, больше не будет восстановлений
+                self.hack_restore_smiley = ""
+            else:
+                # Убираем лишнее слово
+                self._play("complete")
+                # Находим и заменяем первое попавшееся слово на точки
+                word_replaced = False
+                for i in range(len(self.hack_display)):
+                    if i >= 3:  # Пропускаем первые строки (заголовки)
+                        parts = self.hack_display[i].split()
+                        if len(parts) >= 4:
+                            # Проверяем первую колонку
+                            col1 = parts[1].strip()
+                            if col1 and any(col1.startswith(word) for word in WORD_BANK):
+                                if not col1.startswith(self.hack_correct_password):
+                                    parts[1] = "............".ljust(12)
+                                    self.hack_display[i] = f"{parts[0]} {parts[1]}  {parts[2]} {parts[3]}"
+                                    word_replaced = True
+                                    break
+                            # Проверяем вторую колонку
+                            col2 = parts[3].strip()
+                            if col2 and any(col2.startswith(word) for word in WORD_BANK):
+                                if not col2.startswith(self.hack_correct_password):
+                                    parts[3] = "............".ljust(12)
+                                    self.hack_display[i] = f"{parts[0]} {parts[1]}  {parts[2]} {parts[3]}"
+                                    word_replaced = True
+                                    break
+                if word_replaced:
+                    self.hack_guess_history.append((f"[БОНУС] {text}", "Убрана обманка"))
+                else:
+                    self.hack_guess_history.append((f"[БОНУС] {text}", "Нет слов для удаления"))
+            
+            # Удаляем использованный смайл из списка бонусов
+            self.hack_bonus_codes.remove(text)
+            self._render_hack_screen()
+            return
+        
+        # Проверка пароля (остальной код без изменений)
+        matches = calculate_positional_matches(text, self.hack_correct_password)
+        self.hack_guess_history.append((text, f"{matches}/{len(self.hack_correct_password)} совпадений"))
+        self.hack_attempts -= 1
+        
+        if text == self.hack_correct_password:
+            self.hack_state = "SUCCESS"
+            self._play("unlocked")
+            self.current_user = AUTHORIZED_USER_LABEL
+            
+            self.output.clear()
+            display_lines = self.hack_display[:]
+            display_lines.append("".ljust(43) + f">{text}")
+            display_lines.append("".ljust(43) + f">{matches}/{len(self.hack_correct_password)} совпадений")
+            display_lines.append("".ljust(43) + ">Пароль принят")
+            display_lines.append("")
+            display_lines.append(f">Вы авторизованы как: {self.current_user}")
+            
+            self.output.push("\n".join(display_lines), instant=True)
+            self._schedule(AUTH_SUCCESS_DELAY_SECONDS, self._enter_main_menu)
+            
+        elif self.hack_attempts <= 0:
+            self.hack_state = "FAILED"
+            self._play("error")
+            
+            self.output.clear()
+            display_lines = self.hack_display[:]
+            display_lines.append("".ljust(43) + ">Доступ запрещен")
+            display_lines.append("".ljust(43) + ">ТЕРМИНАЛ ЗАБЛОКИРОВАН")
+            display_lines.append("".ljust(43) + f">Правильный пароль: {self.hack_correct_password}")
+            
+            self.output.push("\n".join(display_lines), instant=True)
+            self.state = self.STATE_CLOSING
+            self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
+            
+        else:
+            self._play("error")
+            self._render_hack_screen()
+
+    def _handle_hack_input(self, text):
+        """Обрабатывает ввод в мини-игре взлома."""
+        if self.hack_state == "SUCCESS" or self.hack_state == "FAILED":
+            return
+        
+        if text:
+            self._try_hack_guess(text.upper().strip())
 
     def _enter_main_menu(self):
         self.state = self.STATE_MAIN_MENU
@@ -929,33 +1181,7 @@ class TerminalApp:
             return
 
         if self.state == self.STATE_HACK_MINIGAME:
-            if text.isdigit():
-                idx = int(text)
-                if 1 <= idx <= len(self.hack_candidates):
-                    guess = self.hack_candidates[idx - 1]
-                    if guess == self.hack_answer:
-                        self._play("unlocked")
-                        self.current_user = AUTHORIZED_USER_LABEL
-                        self.state = self.STATE_AUTH_SUCCESS
-                        self.output.push(
-                            "\nВЗЛОМ УСПЕШЕН.\nПАРОЛЬ ПОДОБРАН.\n"
-                            f"Вы авторизованы как: {self.current_user}\n",
-                            instant=True,
-                        )
-                        self._schedule(AUTH_SUCCESS_DELAY_SECONDS, self._enter_main_menu)
-                        return
-                    matches = sum(1 for a, b in zip(guess, self.hack_answer) if a == b)
-                    self.password_attempts_used += 1
-                    attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
-                    self._play("error")
-                    if attempts_left <= 0:
-                        self.state = self.STATE_CLOSING
-                        self.output.push("\nДОСТУП ЗАПРЕЩЁН\nВыключение...\n", instant=True)
-                        self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
-                    else:
-                        self._render_hack_screen(
-                            feedback=f"НЕВЕРНО. Совпадений: {matches}/{len(self.hack_answer)}."
-                        )
+            self._handle_hack_input(text)
             return
 
         if self.state in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
@@ -1101,19 +1327,31 @@ class TerminalApp:
                     self._skip_splash()
                 return
             if event.key == pygame.K_ESCAPE:
-                self.running = False
+                if self.state == self.STATE_HACK_MINIGAME and self.hack_state == "ACTIVE":
+                    # Просто очищаем ввод
+                    self.input_text = ""
+                else:
+                    self.running = False
             elif event.key == pygame.K_UP:
                 self.output.scroll(SCROLL_STEP, self._current_max_lines())
             elif event.key == pygame.K_DOWN:
                 self.output.scroll(-SCROLL_STEP, self._current_max_lines())
             elif event.key == pygame.K_RETURN:
                 self._play("clack")
-                if self.output.is_typing():
-                    self.output.skip_typing()
+                if self.state == self.STATE_HACK_MINIGAME:
+                    if self.output.is_typing():
+                        self.output.skip_typing()
+                    else:
+                        submitted = self.input_text
+                        self.input_text = ""
+                        self.handle_submit(submitted)
                 else:
-                    submitted = self.input_text
-                    self.input_text = ""
-                    self.handle_submit(submitted)
+                    if self.output.is_typing():
+                        self.output.skip_typing()
+                    else:
+                        submitted = self.input_text
+                        self.input_text = ""
+                        self.handle_submit(submitted)
             elif event.key == pygame.K_BACKSPACE:
                 self._play("clack")
                 self.input_text = self.input_text[:-1]
@@ -1145,6 +1383,24 @@ class TerminalApp:
         month = MONTH_ABBR_RU[now.month - 1]
         return f"{now.day:02d} {month} {GAME_YEAR} {now.hour:02d}:{now.minute:02d}"
 
+    def render_ansi_text(self, surf, text, x, y):
+        """Рендерит текст с ANSI-кодами цветов."""
+        parts = re.split(r'(\033\[[0-9;]*m)', text)
+        current_color = COLOR_TEXT
+        cx = x
+        for part in parts:
+            if part.startswith('\033['):
+                if '97m' in part:
+                    current_color = (255, 255, 255)
+                elif '92m' in part:
+                    current_color = COLOR_TEXT
+            else:
+                if part:
+                    part_surf = self.font.render(part, True, current_color)
+                    surf.blit(part_surf, (cx, y))
+                    cx += part_surf.get_width()
+        return cx
+
     # --------------------------------------------------------------- кадр
     def update(self, dt):
         if self.state == self.STATE_SPLASH:
@@ -1156,8 +1412,6 @@ class TerminalApp:
         new_mounts = self._poll_removable_drives()
         if new_mounts:
             self._check_hack_module_on_drives(new_mounts)
-            # Сюда же в будущем можно добавить другие обработчики новых
-            # дисков — например, чтение содержимого голодиска без маркера.
         self._update_scroll_repeat()
         self.cursor_timer += dt
         if self.cursor_timer > 0.5:
@@ -1183,8 +1437,6 @@ class TerminalApp:
 
         now = time.time()
         if self._scroll_hold_start is None:
-            # Момент нажатия уже обработан в handle_event — здесь только
-            # отслеживаем длительность удержания для последующего автоповтора.
             self._scroll_hold_start = now
             self._scroll_next_repeat_at = now + self._scroll_repeat_delay
             return
@@ -1203,11 +1455,6 @@ class TerminalApp:
         bar_x = (RENDER_W - SPLASH_BAR_WIDTH) // 2
         bar_y = RENDER_H - 90
 
-        bar_x = (RENDER_W - SPLASH_BAR_WIDTH) // 2
-        bar_y = RENDER_H - 90
-
-        # Полупрозрачная тёмная подложка под текст и прогресс-бар,
-        # чтобы они не терялись на светлых участках картинки.
         panel_padding = 16
         panel_width = SPLASH_BAR_WIDTH + panel_padding * 2
         panel_top = bar_y - self.font.get_linesize() - 6 - panel_padding
@@ -1216,8 +1463,6 @@ class TerminalApp:
         panel = pygame.Surface((panel_width, panel_height), pygame.SRCALPHA)
         panel.fill((0, 0, 0, 160))
         surf.blit(panel, (panel_x, panel_top))
-
-        label = f"ЗАГРУЗКА {self.splash_progress:03d}%"
 
         label = f"ЗАГРУЗКА {self.splash_progress:03d}%"
         label_surf = self.font.render(label, True, COLOR_TEXT)
@@ -1247,15 +1492,12 @@ class TerminalApp:
         line_h = self.font.get_linesize() + LINE_SPACING
         n = self._current_max_lines()
 
-        if self.fixed_header:
-            # Шапка закреплена сверху и не является частью прокручиваемого буфера —
-            # рисуется каждый кадр напрямую, независимо от output.lines.
+        if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
             for header_line in HEADER_BANNER.split("\n"):
                 header_surf = self.font.render(header_line, True, COLOR_TEXT)
                 surf.blit(header_surf, (MARGIN, y))
                 y += line_h
 
-            # Строка статуса: дата слева, пользователь справа, одна строка.
             date_str = self._current_datetime_str()
             user_str = f"Пользователь: {self.current_user}"
             date_surf = self.font.render(date_str, True, COLOR_TEXT)
@@ -1270,18 +1512,17 @@ class TerminalApp:
         if self.output.has_more_above(n):
             indicator = self.font.render("^ Листать вверх ^", True, COLOR_DIM)
             surf.blit(indicator, (MARGIN, content_top_y))
-        y += line_h  # строка под индикатор всегда резервируется, даже если он не показан
+        y += line_h
 
         visible = self.output.visible_lines(n)
         for line in visible:
-            text_surf = self.font.render(line, True, COLOR_TEXT)
-            surf.blit(text_surf, (MARGIN, y))
+            self.render_ansi_text(surf, line, MARGIN, y)
             y += line_h
 
         if self.output.has_more_below():
             indicator = self.font.render("v Листать вниз v", True, COLOR_DIM)
             surf.blit(indicator, (MARGIN, y))
-        y += line_h  # аналогично резервируем строку снизу
+        y += line_h
 
         if not self.output.is_typing() and self.state not in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
             prompt = "> " + self.input_text + ("_" if self.cursor_visible else " ")
