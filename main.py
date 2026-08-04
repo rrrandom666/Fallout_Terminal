@@ -414,11 +414,6 @@ class TerminalApp:
                 self._known_mount_points = {p.mountpoint for p in psutil.disk_partitions(all=False)}
             except Exception:
                 self._known_mount_points = set()
-        # Неизменный снимок на момент старта приложения — отличаем "диск был
-        # смонтирован ещё до запуска терминала" от "подключили уже при нас".
-        # Нужен интерфейсу чтения голодисков, чтобы найти ТЕКУЩИЙ голодиск,
-        # а не только реагировать на момент вставки.
-        self._startup_mount_points = set(self._known_mount_points)
 
         # Интерфейс чтения-записи голодисков
         self.disk_reader_mount = None
@@ -621,18 +616,40 @@ class TerminalApp:
         self._enter_disk_reader()
 
     def _pick_holotape_mount(self):
-        """Находит ТЕКУЩИЙ голодиск — любой диск, смонтированный уже ПОСЛЕ
-        запуска терминала (в отличие от _poll_removable_drives, который
-        реагирует только на момент вставки, тут нужен диск, который может
-        быть уже вставлен к моменту открытия экрана)."""
+        """Находит ТЕКУЩИЙ голодиск."""
         if not PSUTIL_AVAILABLE:
             return None
+    
         try:
-            current = {p.mountpoint for p in psutil.disk_partitions(all=False)}
-        except Exception:
-            return None
-        candidates = sorted(current - self._startup_mount_points)
-        return candidates[0] if candidates else None
+            partitions = psutil.disk_partitions(all=False)
+        
+            for p in partitions:
+                # Пропускаем системные диски
+                if p.mountpoint in ('/', '/boot', '/System/Volumes/Data'):
+                    continue
+            
+                # Проверяем по признаку съёмности (работает на всех ОС)
+                if 'removable' in p.opts:
+                    return p.mountpoint
+            
+                # macOS: внешние диски в /Volumes/
+                if sys.platform == 'darwin' and p.mountpoint.startswith('/Volumes/'):
+                    if p.mountpoint != '/Volumes' and not p.mountpoint.startswith(('/System/', '/private/')):
+                        return p.mountpoint
+            
+                # Linux: диски в /media/ или /mnt/
+                if sys.platform == 'linux' and p.mountpoint.startswith(('/media/', '/mnt/')):
+                    return p.mountpoint
+            
+                # Windows: любой диск кроме C:
+                if sys.platform == 'win32':
+                    if p.mountpoint and not p.mountpoint.upper().startswith('C:'):
+                        return p.mountpoint
+        
+        except Exception as e:
+            print(f"[ошибка] при определении диска: {e}")
+    
+        return None
 
     def _poll_disk_reader_mount(self):
         now = time.time()
@@ -656,26 +673,79 @@ class TerminalApp:
         self._disk_reader_rebuild("terminal")
         self._disk_reader_rebuild("holotape")
 
-    def _walk_dir_rows(self, root, depth):
+    def _walk_dir_rows(self, root, depth, visited=None, max_depth=3):
         """Рекурсивно строит строки дерева для одной директории.
-        Возвращает список словарей: text (уже с отступом), selectable,
-        abs (полный путь для файла) и rel (путь относительно root)."""
+        Ограничиваем глубину обхода для предотвращения зависаний.
+        Фильтруем скрытые и системные файлы/папки."""
+        if visited is None:
+            visited = set()
+    
+        # Жёсткое ограничение глубины
+        if depth > max_depth:
+            return []
+    
+        # Получаем реальный путь
+        try:
+            real_path = os.path.realpath(root)
+        except OSError:
+            return []
+    
+        # Если уже посещали этот путь — выходим
+        if real_path in visited:
+            return []
+        visited.add(real_path)
+    
         rows = []
         try:
-            entries = sorted(os.listdir(root))
-        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            with os.scandir(root) as it:
+                entries = sorted(it, key=lambda e: e.name)
+        except (FileNotFoundError, NotADirectoryError, PermissionError, OSError):
             return rows
-        dirs = [e for e in entries if os.path.isdir(os.path.join(root, e))]
-        files = [e for e in entries if os.path.isfile(os.path.join(root, e))]
+    
+        dirs = []
+        files = []
+        for entry in entries:
+            try:
+                name = entry.name
+            
+                # Фильтрация скрытых и системных файлов/папок
+                if self._is_hidden_or_system(name):
+                    continue
+            
+                # Проверяем, не симлинк ли это на родительский путь
+                try:
+                    real_sub = os.path.realpath(entry.path)
+                    if real_sub in visited:
+                        continue
+                except OSError:
+                    continue
+            
+                if entry.is_dir(follow_symlinks=False):
+                    # Проверяем, что это действительно директория
+                    try:
+                        if os.path.isdir(entry.path):
+                            dirs.append(entry.name)
+                    except OSError:
+                        continue
+                else:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            files.append(entry.name)
+                    except OSError:
+                        continue
+            except OSError:
+                continue
+    
         indent = "  " * depth
-        for d in dirs:
+        for d in dirs[:100]:  # Ограничиваем количество папок на уровне
             rows.append({"text": f"{indent}{d}/", "selectable": False, "abs": None, "rel": None})
             sub_root = os.path.join(root, d)
-            for row in self._walk_dir_rows(sub_root, depth + 1):
+            for row in self._walk_dir_rows(sub_root, depth + 1, visited, max_depth):
                 if row["rel"] is not None:
                     row["rel"] = os.path.join(d, row["rel"])
                 rows.append(row)
-        for f in files:
+    
+        for f in files[:500]:  # Ограничиваем количество файлов
             rows.append({
                 "text": f"{indent}{f}",
                 "selectable": True,
@@ -689,7 +759,7 @@ class TerminalApp:
         sections = [("Журнал", JOURNAL_DIR), ("Данные", DATA_DIR), ("История чатов", CHAT_HISTORY_DIR)]
         for label, root in sections:
             rows.append({"text": f"{label}/", "selectable": False, "abs": None, "rel": None})
-            for row in self._walk_dir_rows(root, 1):
+            for row in self._walk_dir_rows(root, 1, set()):
                 if row["rel"] is not None:
                     row["rel"] = os.path.join(label, row["rel"])
                 rows.append(row)
@@ -698,7 +768,7 @@ class TerminalApp:
     def _build_holotape_tree_rows(self):
         if not self.disk_reader_mount or not os.path.isdir(self.disk_reader_mount):
             return []
-        return self._walk_dir_rows(self.disk_reader_mount, 0)
+        return self._walk_dir_rows(self.disk_reader_mount, 0, set())
 
     def _disk_reader_rebuild(self, side):
         if side == "terminal":
@@ -800,7 +870,7 @@ class TerminalApp:
             cursor_idx = self.disk_reader_cursor[side]
 
             if side == "holotape" and not self.disk_reader_mount:
-                msg = self.font.render("Ожидание подключения голодиска...", True, COLOR_DIM)
+                msg = self.font.render("Ожидание подключения голодиска...", True, COLOR_TEXT)
                 surf.blit(msg, (x, content_top))
                 continue
 
@@ -835,9 +905,51 @@ class TerminalApp:
 
         footer_y = RENDER_H - bottom_reserved + line_h
         hint = "[Enter] Копировать   [←/→] Колонка   [↑/↓] Курсор   [Esc] В главное меню"
-        surf.blit(self.font.render(hint, True, COLOR_DIM), (MARGIN, footer_y))
+        hint_surf = self.font.render(hint, True, COLOR_TEXT)
+        surf.blit(hint_surf, (MARGIN, footer_y))
         if self.disk_reader_status:
-            surf.blit(self.font.render(self.disk_reader_status[:90], True, COLOR_TEXT), (MARGIN, footer_y + line_h))
+            status_surf = self.font.render(self.disk_reader_status[:90], True, COLOR_TEXT)
+            surf.blit(status_surf, (MARGIN, footer_y + line_h))
+
+    def _is_hidden_or_system(self, name):
+        """Проверяет, является ли файл/папка скрытым или системным."""
+        # Unix-скрытые (начинаются с .)
+        if name.startswith('.'):
+            return True
+    
+        # Системные папки и файлы (общие для всех ОС)
+        system_names = {
+            # Windows
+            'System Volume Information',
+            '$Recycle.Bin',
+            'RECYCLER',
+            'RECYCLED',
+            'pagefile.sys',
+            'hiberfil.sys',
+            'swapfile.sys',
+            'Thumbs.db',
+            'desktop.ini',
+            'Program Files',
+            'Program Files (x86)',
+            'ProgramData',
+            'Windows',
+            # macOS
+            '.DS_Store',
+            '.Trashes',
+            '.fseventsd',
+            '.Spotlight-V100',
+            '.TemporaryItems',
+            # Linux
+            'lost+found',
+        }
+        if name in system_names:
+            return True
+    
+        # Windows-скрытые системные папки (заканчиваются на $)
+        if name.endswith('$'):
+            return True
+    
+        return False
 
     def _launch_hack_module(self):
         """Запуск мини-игры взлома пароля."""
