@@ -27,6 +27,7 @@ import queue
 import datetime
 import random
 import re
+import shutil
 
 import pygame
 
@@ -77,6 +78,7 @@ COLOR_BG = (4, 10, 4)
 COLOR_TEXT = (69, 255, 90)
 COLOR_DIM = (25, 100, 35)
 COLOR_CURSOR = (140, 255, 150)
+COLOR_HIGHLIGHT = (200, 255, 210)  # подсветка выделенной строки в дереве голодиска
 
 BLOOM_DOWNSCALE = 0.18
 BLOOM_ALPHA = 70
@@ -143,6 +145,13 @@ DATA_DIR = "data"
 # Включаемые модули меню — легко выключить, если на конкретной игре не нужны
 ENABLE_DOOR_CONTROL = True
 ENABLE_CHAT = True
+ENABLE_DISK_READER = True
+
+# --------------------------------------------------------------------------
+# Интерфейс чтения-записи голодисков — двухколоночное дерево файлов
+# --------------------------------------------------------------------------
+DISK_READER_LINE_H_EXTRA = 4  # доп. межстрочный интервал для дерева файлов
+DISK_READER_COL_GAP = 24      # зазор между колонками терминала и голодиска
 
 # Звуки
 SOUND_DIR = "media"
@@ -320,6 +329,7 @@ class TerminalApp:
     STATE_DATA_LIST = "DATA_LIST"
     STATE_DATA_VIEW = "DATA_VIEW"
     STATE_DOOR = "DOOR"
+    STATE_DISK_READER = "DISK_READER"
     STATE_CHAT_MENU = "CHAT_MENU"
     STATE_CHAT_HISTORY_LIST = "CHAT_HISTORY_LIST"
     STATE_CHAT_HISTORY_VIEW = "CHAT_HISTORY_VIEW"
@@ -404,6 +414,19 @@ class TerminalApp:
                 self._known_mount_points = {p.mountpoint for p in psutil.disk_partitions(all=False)}
             except Exception:
                 self._known_mount_points = set()
+        # Неизменный снимок на момент старта приложения — отличаем "диск был
+        # смонтирован ещё до запуска терминала" от "подключили уже при нас".
+        # Нужен интерфейсу чтения голодисков, чтобы найти ТЕКУЩИЙ голодиск,
+        # а не только реагировать на момент вставки.
+        self._startup_mount_points = set(self._known_mount_points)
+
+        # Интерфейс чтения-записи голодисков
+        self.disk_reader_mount = None
+        self.disk_reader_focus = "terminal"  # "terminal" | "holotape"
+        self.disk_reader_cursor = {"terminal": 0, "holotape": 0}
+        self.disk_reader_rows = {"terminal": [], "holotape": []}
+        self.disk_reader_status = ""
+        self._last_disk_reader_check_at = 0.0
 
         # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
         self._pending_callback = None
@@ -584,6 +607,237 @@ class TerminalApp:
                 self.output.push("Запускаю режим взлома пароля с внешнего носителя...\n", instant=True)
                 self._schedule(LOCKOUT_DELAY_SECONDS, self._launch_hack_module)
                 return
+
+    # ------------------------------------------------- чтение голодисков
+    def _check_disk_reader_autoopen(self, new_mounts):
+        """Если игрок стоит в главном меню (ничем конкретным не занят) и
+        вставляет голодиск — сразу открываем интерфейс чтения-записи, без
+        похода в подменю. Из любого другого состояния — только вручную,
+        через пункт меню, чтобы не выдёргивать игрока посреди дела."""
+        if not (ENABLE_DISK_READER and new_mounts):
+            return
+        if self.state != self.STATE_MAIN_MENU:
+            return
+        self._enter_disk_reader()
+
+    def _pick_holotape_mount(self):
+        """Находит ТЕКУЩИЙ голодиск — любой диск, смонтированный уже ПОСЛЕ
+        запуска терминала (в отличие от _poll_removable_drives, который
+        реагирует только на момент вставки, тут нужен диск, который может
+        быть уже вставлен к моменту открытия экрана)."""
+        if not PSUTIL_AVAILABLE:
+            return None
+        try:
+            current = {p.mountpoint for p in psutil.disk_partitions(all=False)}
+        except Exception:
+            return None
+        candidates = sorted(current - self._startup_mount_points)
+        return candidates[0] if candidates else None
+
+    def _poll_disk_reader_mount(self):
+        now = time.time()
+        if now - self._last_disk_reader_check_at < DRIVE_POLL_INTERVAL:
+            return
+        self._last_disk_reader_check_at = now
+        mount = self._pick_holotape_mount()
+        if mount != self.disk_reader_mount:
+            self.disk_reader_mount = mount
+            self.disk_reader_cursor["holotape"] = 0
+            self._disk_reader_rebuild("holotape")
+
+    def _enter_disk_reader(self):
+        self.state = self.STATE_DISK_READER
+        self.fixed_header = False
+        self.disk_reader_focus = "terminal"
+        self.disk_reader_cursor = {"terminal": 0, "holotape": 0}
+        self.disk_reader_status = ""
+        self.disk_reader_mount = self._pick_holotape_mount()
+        self._last_disk_reader_check_at = time.time()
+        self._disk_reader_rebuild("terminal")
+        self._disk_reader_rebuild("holotape")
+
+    def _walk_dir_rows(self, root, depth):
+        """Рекурсивно строит строки дерева для одной директории.
+        Возвращает список словарей: text (уже с отступом), selectable,
+        abs (полный путь для файла) и rel (путь относительно root)."""
+        rows = []
+        try:
+            entries = sorted(os.listdir(root))
+        except (FileNotFoundError, NotADirectoryError, PermissionError):
+            return rows
+        dirs = [e for e in entries if os.path.isdir(os.path.join(root, e))]
+        files = [e for e in entries if os.path.isfile(os.path.join(root, e))]
+        indent = "  " * depth
+        for d in dirs:
+            rows.append({"text": f"{indent}{d}/", "selectable": False, "abs": None, "rel": None})
+            sub_root = os.path.join(root, d)
+            for row in self._walk_dir_rows(sub_root, depth + 1):
+                if row["rel"] is not None:
+                    row["rel"] = os.path.join(d, row["rel"])
+                rows.append(row)
+        for f in files:
+            rows.append({
+                "text": f"{indent}{f}",
+                "selectable": True,
+                "abs": os.path.join(root, f),
+                "rel": f,
+            })
+        return rows
+
+    def _build_terminal_tree_rows(self):
+        rows = []
+        sections = [("Журнал", JOURNAL_DIR), ("Данные", DATA_DIR), ("История чатов", CHAT_HISTORY_DIR)]
+        for label, root in sections:
+            rows.append({"text": f"{label}/", "selectable": False, "abs": None, "rel": None})
+            for row in self._walk_dir_rows(root, 1):
+                if row["rel"] is not None:
+                    row["rel"] = os.path.join(label, row["rel"])
+                rows.append(row)
+        return rows
+
+    def _build_holotape_tree_rows(self):
+        if not self.disk_reader_mount or not os.path.isdir(self.disk_reader_mount):
+            return []
+        return self._walk_dir_rows(self.disk_reader_mount, 0)
+
+    def _disk_reader_rebuild(self, side):
+        if side == "terminal":
+            self.disk_reader_rows["terminal"] = self._build_terminal_tree_rows()
+        else:
+            self.disk_reader_rows["holotape"] = self._build_holotape_tree_rows()
+        selectable_count = len(self._disk_reader_selectable(side))
+        if selectable_count == 0:
+            self.disk_reader_cursor[side] = 0
+        else:
+            self.disk_reader_cursor[side] = min(self.disk_reader_cursor[side], selectable_count - 1)
+
+    def _disk_reader_selectable(self, side):
+        return [r for r in self.disk_reader_rows[side] if r["selectable"]]
+
+    def _disk_reader_move_cursor(self, delta):
+        side = self.disk_reader_focus
+        count = len(self._disk_reader_selectable(side))
+        if count == 0:
+            return
+        self.disk_reader_cursor[side] = max(0, min(count - 1, self.disk_reader_cursor[side] + delta))
+
+    def _disk_reader_switch_focus(self):
+        self.disk_reader_focus = "holotape" if self.disk_reader_focus == "terminal" else "terminal"
+
+    def _disk_reader_copy_selected(self):
+        src_side = self.disk_reader_focus
+        dst_side = "holotape" if src_side == "terminal" else "terminal"
+        selectable = self._disk_reader_selectable(src_side)
+        idx = self.disk_reader_cursor[src_side]
+        if not selectable or not (0 <= idx < len(selectable)):
+            self.disk_reader_status = "Нечего копировать — выберите файл."
+            self._play("error")
+            return
+
+        row = selectable[idx]
+        src_path = row["abs"]
+
+        if src_side == "terminal":
+            if not self.disk_reader_mount:
+                self.disk_reader_status = "Голодиск не подключён."
+                self._play("error")
+                return
+            dst_path = os.path.join(self.disk_reader_mount, row["rel"])
+        else:
+            rel = row["rel"]
+            parts = rel.split(os.sep)
+            top = parts[0]
+            rest_parts = parts[1:]
+            if top == "Журнал":
+                dst_root = JOURNAL_DIR
+            elif top == "История чатов":
+                dst_root = CHAT_HISTORY_DIR
+            elif top == "Данные":
+                dst_root = DATA_DIR
+            else:
+                # Неизвестная структура на голодиске — кладём как есть внутрь
+                # data/, верхняя папка голодиска станет новой категорией меню.
+                dst_root = DATA_DIR
+                rest_parts = parts
+            dst_rel = os.path.join(*rest_parts) if rest_parts else os.path.basename(rel)
+            dst_path = os.path.join(dst_root, dst_rel)
+
+        try:
+            os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+            shutil.copy2(src_path, dst_path)
+        except OSError as e:
+            self.disk_reader_status = f"Ошибка копирования: {e}"
+            self._play("error")
+            return
+
+        self._play("complete")
+        self.disk_reader_status = f"Скопировано: {os.path.basename(src_path)}"
+        self._disk_reader_rebuild(dst_side)
+
+    def _render_disk_reader(self, surf):
+        line_h = self.font.get_linesize() + LINE_SPACING
+        col_width = (RENDER_W - MARGIN * 2 - DISK_READER_COL_GAP) // 2
+        left_x = MARGIN
+        right_x = MARGIN + col_width + DISK_READER_COL_GAP
+
+        title = "ИНТЕРФЕЙС ПЕРЕДАЧИ ДАННЫХ"
+        title_surf = self.font.render(title, True, COLOR_TEXT)
+        surf.blit(title_surf, (MARGIN, MARGIN))
+
+        header_y = MARGIN + line_h * 2
+        left_label = "► ТЕРМИНАЛ" if self.disk_reader_focus == "terminal" else "  Терминал"
+        right_label = "► ГОЛОДИСК" if self.disk_reader_focus == "holotape" else "  Голодиск"
+        surf.blit(self.font.render(left_label, True, COLOR_TEXT), (left_x, header_y))
+        surf.blit(self.font.render(right_label, True, COLOR_TEXT), (right_x, header_y))
+
+        content_top = header_y + line_h * 2
+        bottom_reserved = line_h * 4
+        max_rows = max(1, (RENDER_H - content_top - bottom_reserved) // line_h)
+
+        for side, x in (("terminal", left_x), ("holotape", right_x)):
+            rows = self.disk_reader_rows[side]
+            selectable = self._disk_reader_selectable(side)
+            cursor_idx = self.disk_reader_cursor[side]
+
+            if side == "holotape" and not self.disk_reader_mount:
+                msg = self.font.render("Ожидание подключения голодиска...", True, COLOR_DIM)
+                surf.blit(msg, (x, content_top))
+                continue
+
+            if not rows:
+                msg = self.font.render("(пусто)", True, COLOR_DIM)
+                surf.blit(msg, (x, content_top))
+                continue
+
+            # Индекс текущей выделенной строки в общем списке rows (с папками)
+            cursor_row_index = 0
+            if selectable and 0 <= cursor_idx < len(selectable):
+                target = selectable[cursor_idx]
+                cursor_row_index = rows.index(target)
+
+            start = max(0, min(max(0, len(rows) - max_rows), cursor_row_index - max_rows // 2))
+            visible_rows = rows[start:start + max_rows]
+
+            y = content_top
+            for row in visible_rows:
+                is_cursor = (
+                    row["selectable"]
+                    and self.disk_reader_focus == side
+                    and selectable
+                    and 0 <= cursor_idx < len(selectable)
+                    and selectable[cursor_idx] is row
+                )
+                text = ("► " if is_cursor else "  ") + row["text"]
+                color = COLOR_HIGHLIGHT if is_cursor else COLOR_TEXT
+                text_surf = self.font.render(text[:60], True, color)
+                surf.blit(text_surf, (x, y))
+                y += line_h
+
+        footer_y = RENDER_H - bottom_reserved + line_h
+        hint = "[Enter] Копировать   [←/→] Колонка   [↑/↓] Курсор   [Esc] В главное меню"
+        surf.blit(self.font.render(hint, True, COLOR_DIM), (MARGIN, footer_y))
+        if self.disk_reader_status:
+            surf.blit(self.font.render(self.disk_reader_status[:90], True, COLOR_TEXT), (MARGIN, footer_y + line_h))
 
     def _launch_hack_module(self):
         """Запуск мини-игры взлома пароля."""
@@ -845,6 +1099,8 @@ class TerminalApp:
             actions.append(("Управление дверьми", self._enter_door_control))
         if ENABLE_CHAT:
             actions.append(("Чат со S.C.O.P.E.", self._enter_chat_menu))
+        if ENABLE_DISK_READER:
+            actions.append(("Чтение голодисков", self._enter_disk_reader))
         for category in self._list_data_categories():
             actions.append((category, lambda c=category: self._enter_data_category(c)))
         self.main_menu_actions = actions
@@ -1326,6 +1582,22 @@ class TerminalApp:
                 if event.key in (pygame.K_RETURN, pygame.K_SPACE, pygame.K_ESCAPE):
                     self._skip_splash()
                 return
+            if self.state == self.STATE_DISK_READER:
+                if event.key == pygame.K_ESCAPE:
+                    self._play("clack")
+                    self._enter_main_menu()
+                elif event.key == pygame.K_LEFT:
+                    self.disk_reader_focus = "terminal"
+                elif event.key == pygame.K_RIGHT:
+                    self.disk_reader_focus = "holotape"
+                elif event.key == pygame.K_UP:
+                    self._disk_reader_move_cursor(-1)
+                elif event.key == pygame.K_DOWN:
+                    self._disk_reader_move_cursor(1)
+                elif event.key == pygame.K_RETURN:
+                    self._play("clack")
+                    self._disk_reader_copy_selected()
+                return
             if event.key == pygame.K_ESCAPE:
                 if self.state == self.STATE_HACK_MINIGAME and self.hack_state == "ACTIVE":
                     # Просто очищаем ввод
@@ -1412,6 +1684,9 @@ class TerminalApp:
         new_mounts = self._poll_removable_drives()
         if new_mounts:
             self._check_hack_module_on_drives(new_mounts)
+            self._check_disk_reader_autoopen(new_mounts)
+        if self.state == self.STATE_DISK_READER:
+            self._poll_disk_reader_mount()
         self._update_scroll_repeat()
         self.cursor_timer += dt
         if self.cursor_timer > 0.5:
@@ -1483,6 +1758,15 @@ class TerminalApp:
 
         if self.state == self.STATE_SPLASH:
             self._render_splash(surf)
+            scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
+            self.window.blit(scaled, (0, 0))
+            pygame.display.flip()
+            return
+
+        if self.state == self.STATE_DISK_READER:
+            self._render_disk_reader(surf)
+            surf.blit(self.scanlines, (0, 0))
+            surf.blit(self.vignette, (0, 0))
             scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
             self.window.blit(scaled, (0, 0))
             pygame.display.flip()
