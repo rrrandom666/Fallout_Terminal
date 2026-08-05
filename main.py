@@ -124,6 +124,44 @@ UNAUTHORIZED_USER_LABEL = "АНОНИМ"
 AUTHORIZED_USER_LABEL = "БИЛЛ ВАССОН"  
 # ---------------------------------------------------------------------------
 
+# =========================================================================
+# Учётные записи пользователей терминала
+# =========================================================================
+# "level" — уровень доступа: "user", "admin" или "owner".
+#   owner — доступ ко всем пунктам меню, включённым в настройках выше
+#           (ENABLE_DOOR_CONTROL / ENABLE_CHAT / ENABLE_DISK_READER),
+#           и ко всем папкам «Журнал» всех пользователей.
+#   admin — доступ ко всем пунктам меню, кроме чата со S.C.O.P.E.
+#   user  — доступ только к пунктам, формируемым папкой data/, к чтению
+#           голодисков и к собственной папке в «Журнале». Доступ к прочим
+#           пунктам (формируемым самим main.py) можно дать отдельным
+#           пользователям точечно через MENU_ITEM_EXTRA_USER_IDS ниже.
+USER_ACCOUNTS = [
+    {"id": "bill_wasson",   "name": "БИЛЛ ВАССОН",  "password": "HAPPINESS", "level": "owner"},
+    {"id": "lucy_maclean",  "name": "ЛЮСИ МАКЛИН",  "password": "OKEYDOKEY", "level": "user"},
+    {"id": "cooper_howard", "name": "КУПЕР ГОВАРД", "password": "FAMILY",    "level": "admin"},
+]
+
+ACCESS_LEVEL_RANK = {"user": 0, "admin": 1, "owner": 2}
+
+# Минимальный уровень доступа для пунктов меню, формируемых самим main.py
+# (не папками data/ и journal/, и не чтением голодисков — те доступны всем
+# уровням, включая user, безусловно и сюда не включаются).
+MENU_ITEM_MIN_LEVEL = {
+    "door_control": "admin",
+    "chat": "owner",
+}
+
+# Точечный доступ к конкретному пункту меню для отдельных пользователей
+# уровня user, даже если их общего уровня доступа для этого недостаточно.
+# Пример: "door_control": ["lucy_maclean"].
+MENU_ITEM_EXTRA_USER_IDS = {
+    "door_control": [],
+    "chat": [],
+}
+
+ACCESS_DENIED_MESSAGE = "ДОСТУП ЗАПРЕЩЁН\nНедостаточно прав"
+
 MONTH_ABBR_RU = [
     "ЯНВ", "ФЕВ", "МАР", "АПР", "МАЯ", "ИЮН",
     "ИЮЛ", "АВГ", "СЕН", "ОКТ", "НОЯ", "ДЕК",
@@ -318,11 +356,13 @@ class OutputBuffer:
 class TerminalApp:
     STATE_SPLASH = "SPLASH"
     STATE_BOOT = "BOOT"
+    STATE_USER_SELECT = "USER_SELECT"
     STATE_PASSWORD = "PASSWORD"
     STATE_HACK_MINIGAME = "HACK_MINIGAME"
     STATE_AUTH_SUCCESS = "AUTH_SUCCESS"
     STATE_CLOSING = "CLOSING"
     STATE_MAIN_MENU = "MAIN_MENU"
+    STATE_LOG_USER_LIST = "LOG_USER_LIST"
     STATE_LOG_LIST = "LOG_LIST"
     STATE_LOG_VIEW = "LOG_VIEW"
     STATE_LOG_NEW = "LOG_NEW"
@@ -393,6 +433,11 @@ class TerminalApp:
         # Авторизация
         self.password_attempts_used = 0
         self.current_user = UNAUTHORIZED_USER_LABEL
+        self.current_user_id = None
+        self.current_user_level = None
+        self.pending_user = None          # выбранный, но ещё не подтверждённый паролем аккаунт
+        self.current_log_owner_id = None  # чей журнал сейчас просматриваем (актуально для owner)
+        self._ensure_user_journal_dirs()
 
         # Модуль взлома (запускается только с внешней флешки; попытки —
         # общие с обычным вводом пароля, self.password_attempts_used)
@@ -554,18 +599,66 @@ class TerminalApp:
             "ПОДКЛЮЧЕНО\n"
         )
         if DEVMODE:
+            # В режиме разработки пропускаем выбор пользователя и пароль —
+            # авторизуемся первым аккаунтом из списка, чтобы был полный
+            # доступ ко всем пунктам меню при тестировании.
+            self.pending_user = USER_ACCOUNTS[0]
+            self._apply_authenticated_user(self.pending_user)
             self._enter_main_menu()
         else:
-            self._enter_password()
+            self._enter_user_select()
+
+    def _ensure_user_journal_dirs(self):
+        """Создаёт папку журнала для каждого известного пользователя, чтобы
+        листинг и сохранение записей не спотыкались об отсутствующие папки."""
+        for account in USER_ACCOUNTS:
+            path = os.path.join(JOURNAL_DIR, account["id"])
+            try:
+                os.makedirs(path, exist_ok=True)
+            except OSError:
+                pass
+
+    def _apply_authenticated_user(self, account):
+        self.current_user = account["name"]
+        self.current_user_id = account["id"]
+        self.current_user_level = account["level"]
+
+    def _can_access_item(self, item_key):
+        """Проверка доступа к пункту меню, формируемому самим main.py (не
+        папками data/ и journal/, и не чтением голодисков — те доступны
+        всем уровням доступа без исключений)."""
+        if self.current_user_level == "owner":
+            return True
+        min_level = MENU_ITEM_MIN_LEVEL.get(item_key, "user")
+        if self.current_user_level is not None and ACCESS_LEVEL_RANK.get(self.current_user_level, -1) \
+                >= ACCESS_LEVEL_RANK.get(min_level, 0):
+            return True
+        if self.current_user_id in MENU_ITEM_EXTRA_USER_IDS.get(item_key, []):
+            return True
+        return False
+
+    def _deny_access(self):
+        self._play("error")
+        self.output.push(f"\n{ACCESS_DENIED_MESSAGE}\n")
+
+    def _enter_user_select(self):
+        self.state = self.STATE_USER_SELECT
+        self.fixed_header = True
+        self.pending_user = None
+        self.output.clear()
+        items = [(str(i), acc["name"]) for i, acc in enumerate(USER_ACCOUNTS, 1)]
+        text = "ВЫБЕРИТЕ ПОЛЬЗОВАТЕЛЯ\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
 
     def _enter_password(self, extra_message=None):
         self.state = self.STATE_PASSWORD
         self.fixed_header = True
         attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
+        user_name = self.pending_user["name"] if self.pending_user else ""
         if extra_message:
             text = f"{extra_message}\n"
         else:
-            text = "ВВЕДИТЕ ПАРОЛЬ\n"
+            text = f"ПОЛЬЗОВАТЕЛЬ: {user_name}\nВВЕДИТЕ ПАРОЛЬ\n"
         text += f"ПОПЫТОК ОСТАЛОСЬ: " + "■ " * attempts_left + "\nВведите пароль:\n"
         self.output.push(text)
 
@@ -755,8 +848,38 @@ class TerminalApp:
         return rows
 
     def _build_terminal_tree_rows(self):
+        """Строит дерево терминала для интерфейса чтения голодисков — но
+        только из тех разделов и папок, к которым у текущего пользователя
+        есть доступ. Журнал показывает только собственную папку (кроме
+        owner, которому доступны все — с именами пользователей вместо
+        технических ID папок), а История чатов не показывается вовсе,
+        если у пользователя нет доступа к разделу «Чат со S.C.O.P.E.»
+        (см. _can_access_item). Так голодиск не превращается в обходной
+        путь к данным, закрытым в обычном меню."""
         rows = []
-        sections = [("Журнал", JOURNAL_DIR), ("Данные", DATA_DIR), ("История чатов", CHAT_HISTORY_DIR)]
+
+        rows.append({"text": "Журнал/", "selectable": False, "abs": None, "rel": None})
+        if self.current_user_level == "owner":
+            # Отдельная папка на каждого пользователя, подписанная именем,
+            # а не техническим ID (bill_wasson, lucy_maclean, ...).
+            for acc in USER_ACCOUNTS:
+                rows.append({"text": f"  {acc['name']}/", "selectable": False, "abs": None, "rel": None})
+                sub_root = os.path.join(JOURNAL_DIR, acc["id"])
+                for row in self._walk_dir_rows(sub_root, 2, set()):
+                    if row["rel"] is not None:
+                        row["rel"] = os.path.join("Журнал", acc["id"], row["rel"])
+                    rows.append(row)
+        elif self.current_user_id:
+            own_root = os.path.join(JOURNAL_DIR, self.current_user_id)
+            for row in self._walk_dir_rows(own_root, 1, set()):
+                if row["rel"] is not None:
+                    row["rel"] = os.path.join("Журнал", row["rel"])
+                rows.append(row)
+
+        sections = [("Данные", DATA_DIR)]
+        if self._can_access_item("chat"):
+            sections.append(("История чатов", CHAT_HISTORY_DIR))
+
         for label, root in sections:
             rows.append({"text": f"{label}/", "selectable": False, "abs": None, "rel": None})
             for row in self._walk_dir_rows(root, 1, set()):
@@ -818,8 +941,20 @@ class TerminalApp:
             parts = rel.split(os.sep)
             top = parts[0]
             rest_parts = parts[1:]
+            if top == "История чатов" and not self._can_access_item("chat"):
+                # Голодиск может называть свои папки как угодно — имя само
+                # по себе не даёт права записи в закрытый раздел.
+                self.disk_reader_status = "Недостаточно прав для этого раздела."
+                self._play("error")
+                return
             if top == "Журнал":
-                dst_root = JOURNAL_DIR
+                # Импорт всегда идёт в собственный журнал текущего
+                # пользователя — доступа на запись в чужие папки журнала
+                # с голодиска нет ни у кого, кроме как в свою же. Любые
+                # промежуточные сегменты пути (ID/имя пользователя из
+                # дерева owner'а) отбрасываем, берём только имя файла.
+                dst_root = os.path.join(JOURNAL_DIR, self.current_user_id) if self.current_user_id else JOURNAL_DIR
+                rest_parts = [os.path.basename(rel)]
             elif top == "История чатов":
                 dst_root = CHAT_HISTORY_DIR
             elif top == "Данные":
@@ -1162,7 +1297,9 @@ class TerminalApp:
         if text == self.hack_correct_password:
             self.hack_state = "SUCCESS"
             self._play("unlocked")
-            self.current_user = AUTHORIZED_USER_LABEL
+            if self.pending_user is None:
+                self.pending_user = USER_ACCOUNTS[0]
+            self._apply_authenticated_user(self.pending_user)
             
             self.output.clear()
             display_lines = self.hack_display[:]
@@ -1271,30 +1408,65 @@ class TerminalApp:
         except FileNotFoundError:
             self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
 
-    def _list_log_entries(self):
+    def _account_name_by_id(self, user_id):
+        for acc in USER_ACCOUNTS:
+            if acc["id"] == user_id:
+                return acc["name"]
+        return user_id
+
+    def _list_log_entries(self, user_id):
+        folder = os.path.join(JOURNAL_DIR, user_id)
         try:
-            entries = [f for f in os.listdir(JOURNAL_DIR) if f.lower().endswith(".md")]
+            entries = [f for f in os.listdir(folder) if f.lower().endswith(".md")]
             entries.sort()
         except FileNotFoundError:
             entries = []
         return entries
 
     def _enter_log_list(self):
+        # owner видит журналы всех пользователей через промежуточный список;
+        # остальные уровни доступа сразу попадают в свою собственную папку.
+        if self.current_user_level == "owner":
+            self._enter_log_user_list()
+        else:
+            self._enter_log_list_for_user(self.current_user_id)
+
+    def _enter_log_user_list(self):
+        self.state = self.STATE_LOG_USER_LIST
+        self.fixed_header = True
+        self.output.clear()
+        items = [(str(i), acc["name"]) for i, acc in enumerate(USER_ACCOUNTS, 1)]
+        items.append(("0", "В Главное Меню"))
+        text = "\n===Журнал: выберите пользователя===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
+
+    def _enter_log_list_for_user(self, user_id):
         self.state = self.STATE_LOG_LIST
         self.fixed_header = True
         self.output.clear()
-        self.log_entries = self._list_log_entries()
+        self.current_log_owner_id = user_id
+        self.log_entries = self._list_log_entries(user_id)
+        owner_name = self._account_name_by_id(user_id)
         if not self.log_entries:
-            items = [("1", "Создать запись"), ("0", "В Главное Меню")]
+            items = [("1", "Создать запись"), ("0", "Назад")]
             self.output.push(
-                "\nЗаписей в журнале нет.\n\n" + self._format_menu_lines(items) + "\n"
+                f"\n===Журнал: {owner_name}===\n\nЗаписей в журнале нет.\n\n"
+                + self._format_menu_lines(items) + "\n"
             )
             return
         items = [(str(i), os.path.splitext(entry)[0]) for i, entry in enumerate(self.log_entries, 1)]
         items.append((str(len(self.log_entries) + 1), "Создать новую запись"))
-        items.append(("0", "В Главное Меню"))
-        text = "\n===Журнал===\n\n" + self._format_menu_lines(items) + "\n"
+        items.append(("0", "Назад"))
+        text = f"\n===Журнал: {owner_name}===\n\n" + self._format_menu_lines(items) + "\n"
         self.output.push(text)
+
+    def _log_list_back(self):
+        """Куда вернуться из списка записей журнала: owner — к выбору
+        пользователя, остальные уровни доступа — сразу в главное меню."""
+        if self.current_user_level == "owner":
+            self._enter_log_user_list()
+        else:
+            self._enter_main_menu()
 
     def _start_new_log_entry(self):
         self.state = self.STATE_LOG_NEW
@@ -1308,7 +1480,7 @@ class TerminalApp:
         self.state = self.STATE_LOG_VIEW
         self.fixed_header = True
         self.output.clear()
-        path = os.path.join(JOURNAL_DIR, filename)
+        path = os.path.join(JOURNAL_DIR, self.current_log_owner_id, filename)
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
@@ -1321,8 +1493,9 @@ class TerminalApp:
         if not safe_title:
             safe_title = "untitled"
         filename = f"{safe_title}.md"
-        os.makedirs(JOURNAL_DIR, exist_ok=True)
-        filepath = os.path.join(JOURNAL_DIR, filename)
+        folder = os.path.join(JOURNAL_DIR, self.current_log_owner_id)
+        os.makedirs(folder, exist_ok=True)
+        filepath = os.path.join(folder, filename)
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
@@ -1333,6 +1506,9 @@ class TerminalApp:
             self.output.push(f"\nОшибка при сохранении записи: {e}")
 
     def _enter_door_control(self):
+        if not self._can_access_item("door_control"):
+            self._deny_access()
+            return
         self.state = self.STATE_DOOR
         self.fixed_header = True
         self.output.clear()
@@ -1348,6 +1524,9 @@ class TerminalApp:
     MQTT_CONNECT_GRACE_SECONDS = 3.0
 
     def _enter_chat_menu(self):
+        if not self._can_access_item("chat"):
+            self._deny_access()
+            return
         self.state = self.STATE_CHAT_MENU
         self.fixed_header = True
         self.output.clear()
@@ -1521,16 +1700,30 @@ class TerminalApp:
     def handle_submit(self, raw_text):
         text = raw_text.strip()
 
+        if self.state == self.STATE_USER_SELECT:
+            if text.isdigit():
+                idx = int(text)
+                if 1 <= idx <= len(USER_ACCOUNTS):
+                    self.pending_user = USER_ACCOUNTS[idx - 1]
+                    self.password_attempts_used = 0
+                    self._enter_password()
+                    return
+            self._play("error")
+            self.output.push("\nНеизвестная команда.\n")
+            return
+
         if self.state == self.STATE_PASSWORD:
+            if self.pending_user is None:
+                self.pending_user = USER_ACCOUNTS[0]
             if text.upper() == HACK_MODULE_TRIGGER_PASSWORD:
                 # Резервный ручной запуск — не является штатным пунктом
                 # авторизации, см. комментарий у константы выше.
                 self._launch_hack_module()
                 return
-            if text.upper() == CORRECT_PASSWORD:
-                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            if text.upper() == self.pending_user["password"]:
+                self.output.push(f">[{self.pending_user['name']}]: {text}\n", instant=True)
                 self._play("unlocked")
-                self.current_user = AUTHORIZED_USER_LABEL
+                self._apply_authenticated_user(self.pending_user)
                 self.state = self.STATE_AUTH_SUCCESS
                 self.output.push(f"ПАРОЛЬ ПРИНЯТ\nВы авторизованы как: {self.current_user}\n", instant=True)
                 self._schedule(AUTH_SUCCESS_DELAY_SECONDS, self._enter_main_menu)
@@ -1543,7 +1736,7 @@ class TerminalApp:
                 self.output.push("\nДОСТУП ЗАПРЕЩЁН\nВыключение...\n", instant=True)
                 self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
             else:
-                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+                self.output.push(f">[{self.pending_user['name']}]: {text}\n", instant=True)
                 self._play("error")
                 self._enter_password(extra_message="НЕВЕРНЫЙ ПАРОЛЬ")
             return
@@ -1560,17 +1753,27 @@ class TerminalApp:
             self._handle_main_menu(text)
             return
 
+        if self.state == self.STATE_LOG_USER_LIST:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            if text == "0" or text == "":
+                self._enter_main_menu()
+            elif text.isdigit():
+                choice = int(text)
+                if 1 <= choice <= len(USER_ACCOUNTS):
+                    self._enter_log_list_for_user(USER_ACCOUNTS[choice - 1]["id"])
+            return
+
         if self.state == self.STATE_LOG_LIST:
             self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if not self.log_entries:
-                # Пустой журнал: 1 — создать запись, 0 — назад в главное меню
+                # Пустой журнал: 1 — создать запись, 0 — назад
                 if text == "1":
                     self._start_new_log_entry()
                 elif text == "0" or text == "":
-                    self._enter_main_menu()
+                    self._log_list_back()
                 return
             if text == "0" or text == "":
-                self._enter_main_menu()
+                self._log_list_back()
             elif text.isdigit():
                 choice = int(text)
                 if 1 <= choice <= len(self.log_entries):
@@ -1580,7 +1783,7 @@ class TerminalApp:
             return
 
         if self.state == self.STATE_LOG_VIEW:
-            self._enter_log_list()
+            self._enter_log_list_for_user(self.current_log_owner_id)
             return
 
         if self.state == self.STATE_LOG_NEW:
@@ -1671,7 +1874,7 @@ class TerminalApp:
         if self._new_log_title is None:
             if not text:
                 self.output.push("\nОтмена.", instant=True)
-                self._enter_log_list()
+                self._enter_log_list_for_user(self.current_log_owner_id)
                 return
             self._new_log_title = text
             self.output.push("\nВведите запись. Напишите END в конце:")
@@ -1681,7 +1884,7 @@ class TerminalApp:
             self._save_new_log_entry(self._new_log_title, content)
             self._new_log_title = None
             self.new_log_lines = []
-            self._enter_log_list()
+            self._enter_log_list_for_user(self.current_log_owner_id)
             return
         self.new_log_lines.append(text)
 
