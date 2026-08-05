@@ -1,23 +1,14 @@
 """
-Vault-Tec / RobCo Terminal — Pygame edition with CRT bloom/scanline effects.
+RobCo Terminal LARP
 
 Запуск:
     pip install pygame
-    pip install paho-mqtt      # опционально, для чата с мастером по сети
+    pip install paho-mqtt      
     python3 main.py
 
-Звук: ожидает файлы в папке media/ рядом с main.py — см. SOUND_FILES ниже.
-Если файлов нет или аудио недоступно — приложение просто работает без звука.
-
-Сборка в отдельный exe/бинарник (позже, на целевой машине):
+Сборка в отдельный exe/бинарник:
     pip install pyinstaller
     pyinstaller --onefile --windowed --add-data "FalloutDocuments:FalloutDocuments" --add-data "media:media" main.py
-
-Управление:
-    Цифры + Enter — выбор пункта меню (как в оригинальном RobCo-терминале)
-    Стрелки вверх/вниз — прокрутка текста, если он не помещается на экран
-    Esc  — назад / отмена ввода
-    В чате с мастером: просто печатаете текст и жмёте Enter, "exit" — выход из чата
 """
 
 import os
@@ -33,8 +24,7 @@ import pygame
 
 # --------------------------------------------------------------------------
 # Опциональный psutil (определение подключённой флешки с модулем взлома).
-# Если библиотеки нет — автоопределение просто выключено, остаётся
-# резервный ручной триггер (см. HACK_MODULE_TRIGGER_PASSWORD).
+# Если библиотеки нет, есть ручной триггер (HACK_MODULE_TRIGGER_PASSWORD).
 # --------------------------------------------------------------------------
 try:
     import psutil
@@ -45,9 +35,7 @@ except ImportError:
 
 # --------------------------------------------------------------------------
 # Опциональный MQTT (чат с мастером). Если библиотеки нет или брокер
-# недоступен — приложение не падает, а работает в локальном тестовом
-# режиме (эхо ответов), чтобы можно было разрабатывать/тестировать без
-# развёрнутой сети на полигоне.
+# недоступен — приложениеработает в эхо-режиме.
 # --------------------------------------------------------------------------
 try:
     import paho.mqtt.client as mqtt
@@ -110,9 +98,7 @@ HACK_MODULE_TRIGGER_PASSWORD = "ICEBREAKER"
 LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
 MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
 GAME_YEAR = 2276                       
-UNAUTHORIZED_USER_LABEL = "АНОНИМ"     
- 
-# ---------------------------------------------------------------------------
+UNAUTHORIZED_USER_LABEL = "АНОНИМ"
 
 # =========================================================================
 # Учётные записи пользователей терминала
@@ -133,9 +119,7 @@ USER_ACCOUNTS = [
 
 ACCESS_LEVEL_RANK = {"user": 0, "admin": 1, "owner": 2}
 
-# Минимальный уровень доступа для пунктов меню, формируемых самим main.py
-# (не папками data/ и journal/, и не чтением голодисков — те доступны всем
-# уровням, включая user, безусловно и сюда не включаются).
+# Минимальный уровень доступа для пунктов меню.
 MENU_ITEM_MIN_LEVEL = {
     "door_control": "admin",
     "chat": "owner",
@@ -143,7 +127,7 @@ MENU_ITEM_MIN_LEVEL = {
 }
 
 # Точечный доступ к конкретному пункту меню для отдельных пользователей
-# уровня user, даже если их общего уровня доступа для этого недостаточно.
+# уровня user.
 # Пример: "door_control": ["lucy_maclean"].
 MENU_ITEM_EXTRA_USER_IDS = {
     "door_control": [],
@@ -159,7 +143,7 @@ MONTH_ABBR_RU = [
 ]
 TIMEZONE_GMT3 = datetime.timezone(datetime.timedelta(hours=3))
 
-# Закреплённая шапка — отображается статично сверху во всех состояниях
+# Закреплённая шапка
 HEADER_BANNER = (
     "================ ROBCO INDUSTRIES UNIFIED OPERATING SYSTEM ================\n"
     "================== COPYRIGHT 2075-2077 ROBCO INDUSTRIES ==================="
@@ -173,19 +157,21 @@ CHAT_HISTORY_DIR = "chat_history"
 DATA_DIR = "data"
 SYSTEM_DIR = "system"
 
-# Включаемые модули меню — легко выключить, если на конкретной игре не нужны
+# Включаемые модули меню
 ENABLE_DOOR_CONTROL = True
 ENABLE_CHAT = True
 ENABLE_DISK_READER = True
 ENABLE_SYSTEM = True
 
-# --------------------------------------------------------------------------
-# Интерфейс чтения-записи голодисков — двухколоночное дерево файлов
-# --------------------------------------------------------------------------
+# -------------------------------------------------------------------------
+# Интерфейс чтения-записи голодисков
+# -------------------------------------------------------------------------
 DISK_READER_LINE_H_EXTRA = 4  # доп. межстрочный интервал для дерева файлов
 DISK_READER_COL_GAP = 24      # зазор между колонками терминала и голодиска
 
+#--------------------------------------------------------------------------
 # Звуки
+#--------------------------------------------------------------------------
 SOUND_DIR = "media"
 SOUND_FILES = {
     "clicking": "FalloutSoundClicking.mp3",  # печать текста (лупом, пока идёт анимация)
@@ -468,10 +454,6 @@ class TerminalApp:
 
     def __init__(self):
         pygame.init()
-        # Глобальный key-repeat намеренно НЕ включаем: он повторял бы и Enter,
-        # что при удержании кнопки приводило к каскаду лишних отправок формы
-        # (пустой ввод трактуется многими меню как "0"/"назад"). Повтор нужен
-        # только для стрелок прокрутки — реализован вручную в update().
         pygame.display.set_caption("ROBCO INDUSTRIES (TM) TERMLINK")
         self.window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.render_surface = pygame.Surface((RENDER_W, RENDER_H))
@@ -529,8 +511,7 @@ class TerminalApp:
         self.current_log_owner_id = None  # чей журнал сейчас просматриваем (актуально для owner)
         self._ensure_user_journal_dirs()
 
-        # Модуль взлома (запускается только с внешней флешки; попытки —
-        # общие с обычным вводом пароля, self.password_attempts_used)
+        # Модуль взлома 
         self.hack_correct_password = ""
         self.hack_display = []
         self.hack_bonus_codes = []
@@ -541,7 +522,7 @@ class TerminalApp:
         self.hack_initial_render = True
         self.hack_restore_smiley = ""  # Какой смайл восстанавливает попытку
 
-        # Определение флешек — общий механизм (см. константы выше)
+        # Определение флешек
         self._last_drive_poll_at = 0.0
         self._known_mount_points = set()
         if PSUTIL_AVAILABLE:
@@ -558,7 +539,7 @@ class TerminalApp:
         self.disk_reader_status = ""
         self._last_disk_reader_check_at = 0.0
 
-        # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
+        # Отложенные действия 
         self._pending_callback = None
         self._pending_callback_at = None
 
@@ -572,7 +553,7 @@ class TerminalApp:
         self.running = True
         self._frame_count = 0
 
-        # ---------------------------------------------------------- звук
+        # Звук
         self.sound_enabled = True
         self.sounds = {}
         self.typing_channel = None
@@ -607,7 +588,7 @@ class TerminalApp:
         # Создаём системную папку и её структуру
         self._initialize_system_folder()
 
-    # -------------------------------------------------------------- звук
+    # Звук
     def _play(self, name):
         if not self.sound_enabled:
             return
@@ -639,7 +620,7 @@ class TerminalApp:
             except pygame.error:
                 pass
             self._typing_loop_active = False
-    # ------------------------------------------------------------- заставка
+    # Заставка
     def _enter_splash(self):
         self.state = self.STATE_SPLASH
         self.fixed_header = False
