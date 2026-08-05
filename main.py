@@ -91,45 +91,34 @@ SCROLL_STEP = 3  # строк за одно нажатие/повтор стре
 
 # --- Всякоразные переменные --------------------------------------
 MAX_PASSWORD_ATTEMPTS = 4
-CORRECT_PASSWORD = "HAPPINESS"
 AUTH_SUCCESS_DELAY_SECONDS = 2.5   # после верного пароля, перед главным меню
 
 # --------------------------------------------------------------------------
-# Определение подключённых флешек — общий механизм, не привязанный к
-# конкретному модулю. Опрос дисков идёт постоянно (не только на экране
-# пароля); что делать с новым диском — решает уже конкретный обработчик
-# (см. _check_hack_module_on_drives). Так проще добавить другие сценарии
-# чтения флешки позже, без завязки на файл-маркер.
+# Определение подключённых флешек 
 # --------------------------------------------------------------------------
-DRIVE_POLL_INTERVAL = 1.0  # как часто проверять список смонтированных дисков (сек)
+DRIVE_POLL_INTERVAL = 1.0  
 
 # --------------------------------------------------------------------------
-# Модуль взлома пароля — НЕ часть штатного интерфейса системы авторизации.
-# Активируется только когда во время экрана пароля к компьютеру
-# подключается флешка (голодиск-эксплойт) с файлом-маркером на борту.
-# Попытки взлома тратят тот же лимит, что и обычный ввод пароля — с точки
-# зрения системы это ровно то же самое "неверная попытка авторизации".
+# Модуль взлома пароля
 # --------------------------------------------------------------------------
 ENABLE_HACK_MODULE_DETECTION = True         # реагировать ли на маркер флешки
 HACK_MODULE_MARKER_FILENAME = "robco_hack.module"  # файл-маркер в корне флешки
 
-# Резервный ручной запуск — если реальной флешки нет под рукой (тест, показ),
-# либо это способ, которым голодиск-HID сам "впечатывает" триггер в поле пароля.
+# Резервный ручной запуск
 HACK_MODULE_TRIGGER_PASSWORD = "ICEBREAKER"
 
 LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
 MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
 GAME_YEAR = 2276                       
 UNAUTHORIZED_USER_LABEL = "АНОНИМ"     
-AUTHORIZED_USER_LABEL = "БИЛЛ ВАССОН"  
+ 
 # ---------------------------------------------------------------------------
 
 # =========================================================================
 # Учётные записи пользователей терминала
 # =========================================================================
 # "level" — уровень доступа: "user", "admin" или "owner".
-#   owner — доступ ко всем пунктам меню, включённым в настройках выше
-#           (ENABLE_DOOR_CONTROL / ENABLE_CHAT / ENABLE_DISK_READER),
+#   owner — доступ ко всем пунктам меню, включённым в настройках выше,
 #           и ко всем папкам «Журнал» всех пользователей.
 #   admin — доступ ко всем пунктам меню, кроме чата со S.C.O.P.E.
 #   user  — доступ только к пунктам, формируемым папкой data/, к чтению
@@ -150,6 +139,7 @@ ACCESS_LEVEL_RANK = {"user": 0, "admin": 1, "owner": 2}
 MENU_ITEM_MIN_LEVEL = {
     "door_control": "admin",
     "chat": "owner",
+    "system": "admin",
 }
 
 # Точечный доступ к конкретному пункту меню для отдельных пользователей
@@ -158,6 +148,7 @@ MENU_ITEM_MIN_LEVEL = {
 MENU_ITEM_EXTRA_USER_IDS = {
     "door_control": [],
     "chat": [],
+    "system": [],
 }
 
 ACCESS_DENIED_MESSAGE = "ДОСТУП ЗАПРЕЩЁН\nНедостаточно прав"
@@ -176,14 +167,17 @@ HEADER_BANNER = (
 HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n")) + 1  # +1 — строка статуса (дата/пользователь)
 HEADER_GAP_LINES = 1  # пустая строка-отступ между шапкой и прокручиваемым текстом
 
+#Директории
 JOURNAL_DIR = "journal"
 CHAT_HISTORY_DIR = "chat_history"
 DATA_DIR = "data"
+SYSTEM_DIR = "system"
 
 # Включаемые модули меню — легко выключить, если на конкретной игре не нужны
 ENABLE_DOOR_CONTROL = True
 ENABLE_CHAT = True
 ENABLE_DISK_READER = True
+ENABLE_SYSTEM = True
 
 # --------------------------------------------------------------------------
 # Интерфейс чтения-записи голодисков — двухколоночное дерево файлов
@@ -351,6 +345,96 @@ class OutputBuffer:
 
 
 # --------------------------------------------------------------------------
+# Системный логгер
+# --------------------------------------------------------------------------
+class SystemLogger:
+    def __init__(self, system_dir):
+        self.system_dir = system_dir
+        self.log_file = None
+        self.log_path = None
+        self.chat_logging = False  # Флаг: идёт ли логирование чата
+        self.session_start = None
+        
+    def start_session(self, user_name, user_id):
+        """Начинает новую сессию логирования."""
+        self.session_start = datetime.datetime.now(TIMEZONE_GMT3)
+        self.chat_logging = False
+        
+        # Создаём имя файла: ГГГГ-ММ-ДД_ЧЧ-ММ-СС.md
+        filename = f"{GAME_YEAR:04d}-{self.session_start.month:02d}-{self.session_start.day:02d}_" \
+                   f"{self.session_start.hour:02d}-{self.session_start.minute:02d}-{self.session_start.second:02d}.md"
+        
+        # Создаём папку actions если её нет
+        actions_dir = os.path.join(self.system_dir, "actions")
+        os.makedirs(actions_dir, exist_ok=True)
+        
+        self.log_path = os.path.join(actions_dir, filename)
+        
+        # Записываем начало сессии
+        with open(self.log_path, "w", encoding="utf-8") as f:
+            f.write(f"# СЕССИЯ ТЕРМИНАЛА\n\n")
+            f.write(f"**Дата:** {self._format_datetime(self.session_start)}\n")
+            f.write(f"**Пользователь:** {user_name} ({user_id})\n")
+            f.write(f"**Статус:** АКТИВНА\n\n")
+            f.write("---\n\n")
+            f.write("## ЖУРНАЛ ДЕЙСТВИЙ\n\n")
+    
+    def _format_datetime(self, dt):
+        """Форматирует дату и время."""
+        month = MONTH_ABBR_RU[dt.month - 1]
+        return f"{dt.day:02d} {month} {dt.year} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    
+    def _format_timestamp(self, dt):
+        """Форматирует временную метку для лога."""
+        month = MONTH_ABBR_RU[dt.month - 1]
+        return f"{dt.day:02d} {month} {dt.year} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
+    
+    def log(self, speaker, message, is_system=False, is_user_input=False, instant=False):
+        """Записывает событие в лог.
+        
+        Args:
+            speaker: Имя говорящего (пользователь или "SYSTEM")
+            message: Сообщение
+            is_system: Если True, speaker заменяется на "SYSTEM"
+            is_user_input: Если True, это ввод пользователя
+            instant: Если True, пишем в файл немедленно
+        """
+        if not self.log_path or not os.path.exists(self.log_path):
+            return
+        
+        # Если идёт логирование чата, игнорируем все записи
+        if self.chat_logging:
+            return
+        
+        now = datetime.datetime.now(TIMEZONE_GMT3)
+        timestamp = self._format_timestamp(now)
+        
+        # Определяем тип записи
+        if is_system:
+            prefix = "[SYSTEM]"
+        elif is_user_input:
+            prefix = f"[{speaker}]"
+        else:
+            prefix = f"[{speaker}]"
+        
+        # Формируем запись
+        entry = f"**{timestamp}** {prefix}: {message}\n"
+        
+        # Записываем в файл
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(entry)
+    
+    def start_chat_logging(self):
+        """Начинает логирование чата (приостанавливает обычное логирование)."""
+        self.chat_logging = True
+        self.log("SYSTEM", "Начало сеанса чата со S.C.O.P.E.", is_system=True)
+    
+    def stop_chat_logging(self):
+        """Завершает логирование чата (возобновляет обычное логирование)."""
+        self.chat_logging = False
+        self.log("SYSTEM", "Завершение сеанса чата со S.C.O.P.E.", is_system=True)
+
+# --------------------------------------------------------------------------
 # Приложение
 # --------------------------------------------------------------------------
 class TerminalApp:
@@ -375,6 +459,12 @@ class TerminalApp:
     STATE_CHAT_HISTORY_VIEW = "CHAT_HISTORY_VIEW"
     STATE_CHAT = "CHAT"
     STATE_CHAT_SAVED = "CHAT_SAVED"
+    STATE_SYSTEM_MENU = "SYSTEM_MENU"
+    STATE_SYSTEM_VIEW = "SYSTEM_VIEW"
+    STATE_SYSTEM_PROFILES = "SYSTEM_PROFILES"
+    STATE_SYSTEM_PROFILE_VIEW = "SYSTEM_PROFILE_VIEW"
+    STATE_SYSTEM_ACTIONS = "SYSTEM_ACTIONS"
+    STATE_SYSTEM_ACTION_VIEW = "SYSTEM_ACTION_VIEW"
 
     def __init__(self):
         pygame.init()
@@ -511,6 +601,12 @@ class TerminalApp:
 
         self._enter_splash()
 
+        # Системный логгер
+        self.system_logger = SystemLogger(SYSTEM_DIR)
+
+        # Создаём системную папку и её структуру
+        self._initialize_system_folder()
+
     # -------------------------------------------------------------- звук
     def _play(self, name):
         if not self.sound_enabled:
@@ -586,6 +682,177 @@ class TerminalApp:
         if self.state != self.STATE_SPLASH:
             return
         self._leave_splash()
+
+    def _initialize_system_folder(self):
+        """Создаёт системную папку и её структуру согласно конфигурации."""
+        if not ENABLE_SYSTEM:
+            return
+    
+        # Создаём основную папку
+        os.makedirs(SYSTEM_DIR, exist_ok=True)
+    
+        # Создаём файл "Сведения о системе.md"
+        system_info_path = os.path.join(SYSTEM_DIR, "Сведения о системе.md")
+        if not os.path.exists(system_info_path):
+            with open(system_info_path, "w", encoding="utf-8") as f:
+                f.write("""# СВЕДЕНИЯ О СИСТЕМЕ
+
+## Терминальная система ROBCO Industries (TM)
+
+**Версия ОС:** ROBCO OS v2.3.1 (2077)
+**Кодовое имя:** "Vault-Tec Secure"
+**Архитектура:** RobCo TERMLINK v4
+
+---
+
+### Аппаратное обеспечение
+
+**Процессор:** RobCo R-32 (32-бит, 16 МГц)
+**Память:** 64 КБ ОЗУ (расширяемая до 256 КБ)
+**Хранилище:** Голографический накопитель (1 ТБ)
+**Дисплей:** Монохромный TFT, 960x600
+
+---
+
+### Системные модули
+
+| Модуль                 | Статус  | Версия |
+|------------------------|---------|--------|
+| Ядро ОС                | АКТИВЕН | 2.3.1  |
+| Сеть терминалов        | АКТИВНА | 1.4.0  |
+| Протоколы безопасности | АКТИВНЫ | 3.0.0  |
+| Интерфейс голодисков   | АКТИВЕН | 2.1.0  |
+
+---
+
+### Служебная информация
+Хэш-сумма ядра: 0x7F3A9B1C
+Контрольная сумма: 0xDEADBEEF
+Время работы: непрерывно с 2075 года
+""")
+    
+        # Создаём папку actions
+        actions_dir = os.path.join(SYSTEM_DIR, "actions")
+        os.makedirs(actions_dir, exist_ok=True)
+    
+        # Создаём папку profiles
+        profiles_dir = os.path.join(SYSTEM_DIR, "profiles")
+        os.makedirs(profiles_dir, exist_ok=True)
+    
+        # Создаём профили пользователей
+        for account in USER_ACCOUNTS:
+            profile_path = os.path.join(profiles_dir, f"{account['id']}.md")
+            if not os.path.exists(profile_path):
+                with open(profile_path, "w", encoding="utf-8") as f:
+                    f.write(f"""# ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ
+
+## {account['name']}
+
+**ID:** {account['id']}
+**Уровень доступа:** {account['level']}
+**Статус:** АКТИВЕН
+
+---
+
+### Права доступа
+
+{f'''
+- Полный доступ ко всем системам
+- Управление пользователями
+- Доступ к логам всех пользователей
+''' if account['level'] == 'owner' else f'''
+- Стандартный доступ к системе
+- Доступ к собственному журналу
+- Чтение голодисков
+''' if account['level'] == 'user' else f'''
+- Административный доступ
+- Управление дверьми
+- Доступ к системным файлам
+'''}
+
+---
+
+### Хэш-ключ
+{''.join(random.choices('0123456789ABCDEF', k=32))}
+
+""")
+    
+        # Создаём системные файлы для каждого компонента
+        components = []
+        if ENABLE_DOOR_CONTROL:
+            components.append(("door_control", "Управление дверьми"))
+        if ENABLE_CHAT:
+            components.append(("chat", "Чат со S.C.O.P.E."))
+        if ENABLE_DISK_READER:
+            components.append(("disk_reader", "Чтение голодисков"))
+        if ENABLE_SYSTEM:
+            components.append(("system", "Система"))
+    
+        for comp_id, comp_name in components:
+            comp_dir = os.path.join(SYSTEM_DIR, comp_id)
+            os.makedirs(comp_dir, exist_ok=True)
+        
+            # Создаём файл конфигурации компонента
+            config_path = os.path.join(comp_dir, "config.md")
+            if not os.path.exists(config_path):
+                with open(config_path, "w", encoding="utf-8") as f:
+                    f.write(f"""# СИСТЕМНЫЙ ФАЙЛ КОМПОНЕНТА
+
+## {comp_name}
+
+**Идентификатор:** {comp_id}
+**Версия:** 1.0.{random.randint(0, 9)}
+**Статус:** ЗАГРУЖЕН
+
+---
+
+### Параметры
+
+```ini
+[component]
+id = {comp_id}
+name = {comp_name}
+enabled = true
+version = 1.0.{random.randint(0, 9)}
+priority = {random.randint(1, 10)}
+```
+
+### Библиотеки зависимостей
+
+lib_{comp_id}.so (v{random.randint(1, 3)}.{random.randint(0, 9)})
+lib_robco_core.so (v2.3.1)
+lib_vault_network.so (v1.4.0)
+
+### Журнал загрузки
+
+[SYSTEM] Загрузка компонента {comp_id}...
+[SYSTEM] Проверка целостности...
+[SYSTEM] OK
+[SYSTEM] Загрузка зависимостей...
+[SYSTEM] OK
+[SYSTEM] Компонент {comp_name} загружен.
+
+""")
+
+        #Удаляем лишние папки компонентов
+        existing_comps = set()
+        for item in os.listdir(SYSTEM_DIR):
+            item_path = os.path.join(SYSTEM_DIR, item)
+            if os.path.isdir(item_path):
+                existing_comps.add(item)
+        
+        #Удаляем лишние папки (кроме actions, profiles и известных компонентов)
+        known_folders = {"actions", "profiles"}
+        for comp_id, _ in components:
+            known_folders.add(comp_id)
+
+        for folder in existing_comps:
+            if folder not in known_folders:
+                try:
+                    shutil.rmtree(os.path.join(SYSTEM_DIR, folder))
+                except OSError:
+                    pass
+
     # ---------------------------------------------------------------- boot
     def _boot(self):
         self.fixed_header = True
@@ -661,6 +928,7 @@ class TerminalApp:
             text = f"ПОЛЬЗОВАТЕЛЬ: {user_name}\nВВЕДИТЕ ПАРОЛЬ\n"
         text += f"ПОПЫТОК ОСТАЛОСЬ: " + "■ " * attempts_left + "\nВведите пароль:\n"
         self.output.push(text)
+        self.system_logger.start_session(self.current_user, self.current_user_id)
 
     # ------------------------------------------------------ флешки (общее)
     def _poll_removable_drives(self):
@@ -879,6 +1147,8 @@ class TerminalApp:
         sections = [("Данные", DATA_DIR)]
         if self._can_access_item("chat"):
             sections.append(("История чатов", CHAT_HISTORY_DIR))
+        if self._can_access_item("system"):
+            sections.append(("Система", SYSTEM_DIR))
 
         for label, root in sections:
             rows.append({"text": f"{label}/", "selectable": False, "abs": None, "rel": None})
@@ -1350,6 +1620,8 @@ class TerminalApp:
             actions.append(("Чат со S.C.O.P.E.", self._enter_chat_menu))
         if ENABLE_DISK_READER:
             actions.append(("Чтение голодисков", self._enter_disk_reader))
+        if ENABLE_SYSTEM and self._can_access_item("system"):
+            actions.append(("Система", self._enter_system_menu))
         for category in self._list_data_categories():
             actions.append((category, lambda c=category: self._enter_data_category(c)))
         self.main_menu_actions = actions
@@ -1520,6 +1792,155 @@ class TerminalApp:
         )
         self.output.push(text)
 
+    def _enter_system_menu(self):
+        """Вход в системное меню."""
+        if not self._can_access_item("system"):
+            self._deny_access()
+            return
+    
+        self.state = self.STATE_SYSTEM_MENU
+        self.fixed_header = True
+        self.output.clear()
+    
+        # Логируем вход в системное меню
+        self.system_logger.log(self.current_user, "Вход в системное меню", is_user_input=False)
+    
+        items = [
+            ("1", "Сведения о системе"),
+            ("2", "Действия пользователей"),
+            ("3", "Профили пользователей")
+        ]
+        next_num = 4
+        components = []
+        if ENABLE_DOOR_CONTROL:
+            components.append(("door_control", "Управление дверьми"))
+        if ENABLE_CHAT:
+            components.append(("chat", "Чат со S.C.O.P.E."))
+        if ENABLE_DISK_READER:
+            components.append(("disk_reader", "Чтение голодисков"))
+    
+        for comp_id, comp_name in components:
+            items.append((str(next_num), comp_name))
+            next_num += 1
+    
+        items.append(("0", "В Главное Меню"))
+
+        text = "\n===СИСТЕМА===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
+
+    def _enter_system_view(self, category):
+        """Просмотр системного файла."""
+        self.state = self.STATE_SYSTEM_VIEW
+        self.fixed_header = True
+        self.output.clear()
+
+        if category == "info":
+            path = os.path.join(SYSTEM_DIR, "Сведения о системе.md")
+            self.system_logger.log(self.current_user, "Просмотр сведений о системе", is_user_input=False)
+        else:
+            comp_path = os.path.join(SYSTEM_DIR, category, "config.md")
+            path = comp_path
+            self.system_logger.log(self.current_user, f"Просмотр системного файла компонента: {category}", is_user_input=False)
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.output.push(f"\n{content}\n\n[Нажмите Enter, чтобы вернуться...]")
+        except FileNotFoundError:
+            self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
+
+    def _enter_system_profiles(self):
+        """Вход в список профилей пользователей."""
+        self.state = self.STATE_SYSTEM_PROFILES
+        self.fixed_header = True
+        self.output.clear()
+    
+        self.system_logger.log(self.current_user, "Просмотр списка профилей", is_user_input=False)
+    
+        profiles_dir = os.path.join(SYSTEM_DIR, "profiles")
+        try:
+            profiles = [f for f in os.listdir(profiles_dir) if f.endswith(".md")]
+            profiles.sort()
+        except FileNotFoundError:
+            profiles = []
+    
+        if not profiles:
+            items = [("0", "Назад")]
+            self.output.push("\n===ПРОФИЛИ ПОЛЬЗОВАТЕЛЕЙ===\n\nНет сохранённых профилей.\n\n" + self._format_menu_lines(items) + "\n")
+            return
+    
+        items = []
+        for i, p in enumerate(profiles, 1):
+            user_id = os.path.splitext(p)[0]
+            # Находим имя пользователя по ID
+            user_name = user_id
+            for acc in USER_ACCOUNTS:
+                if acc["id"] == user_id:
+                    user_name = acc["name"]
+                    break
+            items.append((str(i), user_name))
+        items.append(("0", "Назад"))
+        text = "\n===ПРОФИЛИ ПОЛЬЗОВАТЕЛЕЙ===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
+
+    def _view_system_profile(self, filename):
+        """Просмотр профиля пользователя."""
+        self.state = self.STATE_SYSTEM_PROFILE_VIEW
+        self.fixed_header = True
+        self.output.clear()
+    
+        user_id = os.path.splitext(filename)[0]
+        self.system_logger.log(self.current_user, f"Просмотр профиля: {user_id}", is_user_input=False)
+    
+        path = os.path.join(SYSTEM_DIR, "profiles", filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.output.push(f"\n{content}\n\n[Нажмите Enter, чтобы вернуться...]")
+        except FileNotFoundError:
+            self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
+
+    def _enter_system_actions(self):
+        """Вход в список логов действий."""
+        self.state = self.STATE_SYSTEM_ACTIONS
+        self.fixed_header = True
+        self.output.clear()
+    
+        self.system_logger.log(self.current_user, "Просмотр списка логов", is_user_input=False)
+    
+        actions_dir = os.path.join(SYSTEM_DIR, "actions")
+        try:
+            logs = [f for f in os.listdir(actions_dir) if f.endswith(".md")]
+            logs.sort(reverse=True)  # Свежие сверху
+        except FileNotFoundError:
+            logs = []
+    
+        if not logs:
+            items = [("0", "Назад")]
+            self.output.push("\n===ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЕЙ===\n\nНет сохранённых логов.\n\n" + self._format_menu_lines(items) + "\n")
+            return
+    
+        items = [(str(i+1), os.path.splitext(l)[0]) for i, l in enumerate(logs)]
+        items.append(("0", "Назад"))
+        text = "\n===ДЕЙСТВИЯ ПОЛЬЗОВАТЕЛЕЙ===\n\n" + self._format_menu_lines(items) + "\n"
+        self.output.push(text)
+
+    def _view_system_action(self, filename):
+        """Просмотр лога действий."""
+        self.state = self.STATE_SYSTEM_ACTION_VIEW
+        self.fixed_header = True
+        self.output.clear()
+    
+        self.system_logger.log(self.current_user, f"Просмотр лога: {filename}", is_user_input=False)
+    
+        path = os.path.join(SYSTEM_DIR, "actions", filename)
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.output.push(f"\n{content}\n\n[Нажмите Enter, чтобы вернуться...]")
+        except FileNotFoundError:
+            self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
+
     # -------------------------------------------------------------- чат-ИИ
     MQTT_CONNECT_GRACE_SECONDS = 3.0
 
@@ -1600,6 +2021,7 @@ class TerminalApp:
         self.state = self.STATE_CHAT
         self.fixed_header = True
         self.output.clear()
+        self.system_logger.start_chat_logging()
         self.output.push("\n[Подключение к S.C.O.P.E...]\n", instant=True)
         self._chat_status_resolved = False
         self._chat_connect_deadline = time.time() + self.MQTT_CONNECT_GRACE_SECONDS
@@ -1750,6 +2172,7 @@ class TerminalApp:
 
         if self.state == self.STATE_MAIN_MENU:
             self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            self.system_logger.log(self.current_user, text, is_user_input=True)
             self._handle_main_menu(text)
             return
 
@@ -1818,6 +2241,89 @@ class TerminalApp:
             elif text == "0" or text == "":
                 self._enter_main_menu()
             return
+        
+        if self.state == self.STATE_SYSTEM_MENU:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            if text == "0" or text == "":
+                self._enter_main_menu()
+                return
+            elif text == "1":
+                self._enter_system_view("info")
+                return
+            elif text == "2":
+                self._enter_system_actions()
+                return
+            elif text == "3":
+                self._enter_system_profiles()
+                return
+            elif text.isdigit():
+                choice = int(text)
+                components = []
+                if ENABLE_DOOR_CONTROL:
+                    components.append(("door_control", "Управление дверьми"))
+                if ENABLE_CHAT:
+                    components.append(("chat", "Чат со S.C.O.P.E."))
+                if ENABLE_DISK_READER:
+                    components.append(("disk_reader", "Чтение голодисков"))
+        
+                if 4 <= choice <= 3 + len(components):
+                    comp_index = choice - 4
+                    if 0 <= comp_index < len(components):
+                        comp_id = components[comp_index][0]
+                        self._enter_system_view(comp_id)
+                        return
+                else:
+                    self._play("error")
+                    self.output.push("\nНеизвестная команда.\n")
+                    return
+            else:
+                self._play("error")
+                self.output.push("\nНеизвестная команда.\n")
+                return
+
+        if self.state == self.STATE_SYSTEM_VIEW:
+            self._enter_system_menu()
+            return
+
+        if self.state == self.STATE_SYSTEM_PROFILES:
+            if text == "0" or text == "":
+                self._enter_system_menu()
+            elif text.isdigit():
+                choice = int(text)
+                profiles_dir = os.path.join(SYSTEM_DIR, "profiles")
+                try:
+                    profiles = [f for f in os.listdir(profiles_dir) if f.endswith(".md")]
+                    profiles.sort()
+                    if 1 <= choice <= len(profiles):
+                        self._view_system_profile(profiles[choice - 1])
+                except FileNotFoundError:
+                    self.output.push("\nОшибка: папка profiles не найдена.\n")
+                    return
+            return
+
+        if self.state == self.STATE_SYSTEM_PROFILE_VIEW:
+            self._enter_system_profiles()
+            return
+
+        if self.state == self.STATE_SYSTEM_ACTIONS:
+            if text == "0" or text == "":
+                self._enter_system_menu()
+            elif text.isdigit():
+                choice = int(text)
+                actions_dir = os.path.join(SYSTEM_DIR, "actions")
+                try:
+                    logs = [f for f in os.listdir(actions_dir) if f.endswith(".md")]
+                    logs.sort(reverse=True)
+                    if 1 <= choice <= len(logs):
+                        self._view_system_action(logs[choice - 1])
+                except FileNotFoundError:
+                    self.output.push("\nОшибка: папка actions не найдена.\n")
+                    return
+            return
+
+        if self.state == self.STATE_SYSTEM_ACTION_VIEW:
+            self._enter_system_actions()
+            return
 
         if self.state == self.STATE_CHAT_MENU:
             if text == "1":
@@ -1848,6 +2354,7 @@ class TerminalApp:
             if text.lower() == "exit":
                 self._mqtt_disconnect()
                 self._save_chat_history()
+                self.system_logger.stop_chat_logging()
             elif text:
                 self._send_chat_message(text)
             return
@@ -1860,6 +2367,7 @@ class TerminalApp:
         if text == "0":
             self.state = self.STATE_CLOSING
             self.output.push("\nЗавершение сеанса...\nВыключение...\n")
+            self.system_logger.log("SYSTEM", "Сессия завершена", is_system=True)
             self._schedule(MENU_CLOSE_DELAY_SECONDS, self._quit)
         elif text.isdigit() and 1 <= int(text) <= len(self.main_menu_actions):
             _, action = self.main_menu_actions[int(text) - 1]
