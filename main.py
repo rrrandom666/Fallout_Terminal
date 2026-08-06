@@ -1070,62 +1070,77 @@ lib_vault_network.so (v1.4.0)
             print(f"[карта] не удалось загрузить привязку {MAP_BOUNDS_PATH}: {e}")
             self.map_bounds = None
     
-    def _world_to_screen(self, lat, lon):
-        """
-        Преобразует мировые координаты в экранные с использованием привязки карты
-        """
+    def _get_effective_bounds(self):
+        """Текущее окно камеры (позиция + зум), обрезанное по границам загруженной карты."""
+        half = self.map_zoom
+        lat_min = self.map_view_lat - half
+        lat_max = self.map_view_lat + half
+        lon_min = self.map_view_lon - half
+        lon_max = self.map_view_lon + half
+        if self.map_bounds:
+            lat_min = max(lat_min, self.map_bounds["min_lat"])
+            lat_max = min(lat_max, self.map_bounds["max_lat"])
+            lon_min = max(lon_min, self.map_bounds["min_lon"])
+            lon_max = min(lon_max, self.map_bounds["max_lon"])
+            if lat_min >= lat_max:
+                lat_min, lat_max = self.map_bounds["min_lat"], self.map_bounds["max_lat"]
+            if lon_min >= lon_max:
+                lon_min, lon_max = self.map_bounds["min_lon"], self.map_bounds["max_lon"]
+        return lat_min, lat_max, lon_min, lon_max
+
+    def _clamp_map_view(self):
+        """Не даёт камере полностью уйти за пределы загруженной карты."""
         if not self.map_bounds:
-            # Fallback: используем текущий вьюпорт
-            half_zoom = self.map_zoom
-            lat_min = self.map_view_lat - half_zoom
-            lat_max = self.map_view_lat + half_zoom
-            lon_min = self.map_view_lon - half_zoom
-            lon_max = self.map_view_lon + half_zoom
-        else:
-            # Используем реальные границы карты
-            lat_min = self.map_bounds["min_lat"]
-            lat_max = self.map_bounds["max_lat"]
-            lon_min = self.map_bounds["min_lon"]
-            lon_max = self.map_bounds["max_lon"]
+            return
+        self.map_view_lat = min(max(self.map_view_lat, self.map_bounds["min_lat"]), self.map_bounds["max_lat"])
+        self.map_view_lon = min(max(self.map_view_lon, self.map_bounds["min_lon"]), self.map_bounds["max_lon"])
+
+    def _map_image_subsurface_for_view(self, lat_min, lat_max, lon_min, lon_max):
+        """Вырезает и масштабирует нужный фрагмент карты под текущее окно камеры."""
+        if not self.map_image:
+            return None
+        if not self.map_bounds:
+            return self.map_image
+
+        img_w, img_h = self.map_image.get_size()
+        b_lat_min, b_lat_max = self.map_bounds["min_lat"], self.map_bounds["max_lat"]
+        b_lon_min, b_lon_max = self.map_bounds["min_lon"], self.map_bounds["max_lon"]
+
+        x1 = (lon_min - b_lon_min) / (b_lon_max - b_lon_min) * img_w
+        x2 = (lon_max - b_lon_min) / (b_lon_max - b_lon_min) * img_w
+        y1 = (b_lat_max - lat_max) / (b_lat_max - b_lat_min) * img_h
+        y2 = (b_lat_max - lat_min) / (b_lat_max - b_lat_min) * img_h
+
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2 = min(img_w, max(x1 + 1, int(x2)))
+        y2 = min(img_h, max(y1 + 1, int(y2)))
+
+        try:
+            crop = self.map_image.subsurface((x1, y1, x2 - x1, y2 - y1))
+            return pygame.transform.smoothscale(crop.copy(), (RENDER_W, RENDER_H))
+        except ValueError:
+            return self.map_image
     
-        # Проверяем, что точка в пределах карты
+    def _world_to_screen(self, lat, lon):
+        lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
         if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
             return None, None
-    
         margin = 20
         screen_w = RENDER_W - margin * 2
         screen_h = RENDER_H - margin * 2
-    
         x = margin + ((lon - lon_min) / (lon_max - lon_min)) * screen_w
         y = margin + ((lat_max - lat) / (lat_max - lat_min)) * screen_h
-    
         return int(x), int(y)
 
     def _screen_to_world(self, screen_x, screen_y):
-        """
-        Преобразует экранные координаты в мировые (для создания отметок в центре экрана)
-        """
-        if not self.map_bounds:
-            # Fallback: используем текущий вьюпорт
-            half_zoom = self.map_zoom
-            lat_min = self.map_view_lat - half_zoom
-            lat_max = self.map_view_lat + half_zoom
-            lon_min = self.map_view_lon - half_zoom
-            lon_max = self.map_view_lon + half_zoom
-        else:
-            lat_min = self.map_bounds["min_lat"]
-            lat_max = self.map_bounds["max_lat"]
-            lon_min = self.map_bounds["min_lon"]
-            lon_max = self.map_bounds["max_lon"]
-    
+        lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
         margin = 20
         screen_w = RENDER_W - margin * 2
         screen_h = RENDER_H - margin * 2
-    
-        # Преобразуем экранные координаты в мировые
         lat = lat_max - ((screen_y - margin) / screen_h) * (lat_max - lat_min)
         lon = lon_min + ((screen_x - margin) / screen_w) * (lon_max - lon_min)
-    
         return lat, lon
 
     def _enter_map(self):
@@ -1147,22 +1162,16 @@ lib_vault_network.so (v1.4.0)
         self.output.push("R - проложить маршрут | Esc - выход\n")
 
     def _render_map(self, surf):
-        """Рендерит карту"""
-        # Рисуем карту
-        if self.map_image:
-            surf.blit(self.map_image, (0, 0))
+        lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
+
+        view_surf = self._map_image_subsurface_for_view(lat_min, lat_max, lon_min, lon_max)
+        if view_surf:
+            surf.blit(view_surf, (0, 0))
         else:
             surf.fill((10, 20, 10))
             text = self.font.render("Карта не загружена", True, COLOR_TEXT)
             surf.blit(text, (RENDER_W//2 - text.get_width()//2, RENDER_H//2))
-    
-        # Рисуем отметки
-        half_zoom = self.map_zoom
-        lat_min = self.map_view_lat - half_zoom
-        lat_max = self.map_view_lat + half_zoom
-        lon_min = self.map_view_lon - half_zoom
-        lon_max = self.map_view_lon + half_zoom
-    
+
         visible_markers = self.map_markers.get_markers_in_view(lat_min, lat_max, lon_min, lon_max)
     
         for marker in visible_markers:
@@ -2960,12 +2969,16 @@ lib_vault_network.so (v1.4.0)
                     self._enter_main_menu()
                 elif event.key == pygame.K_UP:
                     self.map_view_lat += self.map_zoom * 0.1
+                    self._clamp_map_view()
                 elif event.key == pygame.K_DOWN:
                     self.map_view_lat -= self.map_zoom * 0.1
+                    self._clamp_map_view()
                 elif event.key == pygame.K_LEFT:
                     self.map_view_lon -= self.map_zoom * 0.1
+                    self._clamp_map_view()
                 elif event.key == pygame.K_RIGHT:
                     self.map_view_lon += self.map_zoom * 0.1
+                    self._clamp_map_view()
                 elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
                     self.map_zoom = max(0.001, self.map_zoom * 0.9)
                 elif event.key == pygame.K_MINUS:
@@ -3150,6 +3163,23 @@ lib_vault_network.so (v1.4.0)
         surf.blit(self.scanlines, (0, 0))
         surf.blit(self.vignette, (0, 0))
 
+    def _render_map_message_overlay(self, surf):
+        """Показывает сообщения карты (вход, выбор отметки, ошибки и т.д.) —
+        иначе self.output никогда не рендерится в режиме карты."""
+        line_h = self.font.get_linesize() + LINE_SPACING
+        lines = self.output.visible_lines(6)
+        if not lines:
+            return
+        panel_w = RENDER_W - MARGIN * 2
+        panel_h = line_h * len(lines) + 16
+        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 170))
+        surf.blit(panel, (MARGIN, MARGIN))
+        y = MARGIN + 8
+        for line in lines:
+            self.render_ansi_text(surf, line, MARGIN + 8, y)
+            y += line_h
+
     def render(self):
         surf = self.render_surface
         surf.fill(COLOR_BG)
@@ -3175,6 +3205,7 @@ lib_vault_network.so (v1.4.0)
             # Если в режиме ввода текста отметки
             if self.map_state == "ADD_MARKER_TEXT":
                 self._render_marker_input(surf)
+            self._render_map_message_overlay(surf)
         
             # Применяем эффекты
             bloom = make_bloom(surf)
