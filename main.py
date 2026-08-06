@@ -29,6 +29,7 @@ import random
 import re
 import shutil
 import json
+import textwrap
 
 import pygame
 
@@ -244,6 +245,16 @@ MAP_ZOOM_LEVEL = 0.015
 COLOR_MAP_MARKER = (255, 200, 50)  
 COLOR_MAP_ROUTE = (255, 50, 50)    
 COLOR_MAP_TERMINAL = (255, 50, 50)
+
+# Геометрия рабочей области карты: широкая колонка слева (сама карта) и
+# узкая колонка справа (статус/подсказки/системный текст/ввод названия).
+MAP_SIDEBAR_WIDTH = 260
+MAP_COLUMN_GAP = 20
+MAP_INNER_MARGIN = 16  # отступ содержимого карты внутри левой колонки
+
+# Шаг перемещения прицела по стрелкам в режиме выбора точки — доля
+# текущего зума, чтобы на любом уровне приближения шаг был соразмерным.
+MAP_CURSOR_STEP_FACTOR = 0.08
 
 # =========================================================================
 # Функции для мини-игры взлома
@@ -791,6 +802,24 @@ class TerminalApp:
         self.map_route_target = None
         self.map_marker_input = ""
         self.map_state = "VIEW"
+        # Координаты прицела в режиме наведения (CURSOR_MARKER/CURSOR_ROUTE)
+        # и координаты, подтверждённые прицелом и ожидающие названия отметки.
+        self.map_cursor_lat = None
+        self.map_cursor_lon = None
+        self.map_pending_marker_latlon = None
+
+        # Геометрия рабочей области карты: широкая колонка слева (сама
+        # карта) и узкая колонка справа (текст/ввод) — считается один раз,
+        # т.к. зависит только от констант RENDER_W/H, MARGIN и ширины
+        # сайдбара.
+        self.map_viewport_x = MARGIN
+        self.map_viewport_y = MARGIN
+        self.map_viewport_w = RENDER_W - MARGIN * 2 - MAP_COLUMN_GAP - MAP_SIDEBAR_WIDTH
+        self.map_viewport_h = RENDER_H - MARGIN * 2
+        self.map_sidebar_x = self.map_viewport_x + self.map_viewport_w + MAP_COLUMN_GAP
+        self.map_sidebar_y = MARGIN
+        self.map_sidebar_w = MAP_SIDEBAR_WIDTH
+        self.map_sidebar_h = RENDER_H - MARGIN * 2
 
         # Загружаем карту
         self._load_map_image()
@@ -1047,7 +1076,9 @@ lib_vault_network.so (v1.4.0)
         map_path = os.path.join("images", "map.png")
         try:
             img = pygame.image.load(map_path)
-            self.map_image = pygame.transform.smoothscale(img, (RENDER_W, RENDER_H))
+            # Сохраняем оригинал без предварительного масштабирования — нужен
+            # для вырезания произвольного окна камеры в _map_image_subsurface_for_view.
+            self.map_image = img.convert()
         except (pygame.error, FileNotFoundError):
             print(f"[карта] не удалось загрузить {map_path}")
             self.map_image = None
@@ -1069,47 +1100,67 @@ lib_vault_network.so (v1.4.0)
         except (FileNotFoundError, json.JSONDecodeError) as e:
             print(f"[карта] не удалось загрузить привязку {MAP_BOUNDS_PATH}: {e}")
             self.map_bounds = None
-    
+
     def _get_effective_bounds(self):
-        """Текущее окно камеры (позиция + зум), обрезанное по границам загруженной карты."""
+        """Текущее окно камеры (позиция self.map_view_lat/lon + зум
+        self.map_zoom), обрезанное по фактическим границам загруженной
+        карты. Используется и для вырезания картинки, и для перевода
+        мировых координат в экранные — раньше эти два места считали
+        по-разному, из-за чего карта не двигалась, а отметки "убегали"."""
         half = self.map_zoom
         lat_min = self.map_view_lat - half
         lat_max = self.map_view_lat + half
         lon_min = self.map_view_lon - half
         lon_max = self.map_view_lon + half
         if self.map_bounds:
-            lat_min = max(lat_min, self.map_bounds["min_lat"])
-            lat_max = min(lat_max, self.map_bounds["max_lat"])
-            lon_min = max(lon_min, self.map_bounds["min_lon"])
-            lon_max = min(lon_max, self.map_bounds["max_lon"])
-            if lat_min >= lat_max:
-                lat_min, lat_max = self.map_bounds["min_lat"], self.map_bounds["max_lat"]
-            if lon_min >= lon_max:
-                lon_min, lon_max = self.map_bounds["min_lon"], self.map_bounds["max_lon"]
+            b_lat_min = self.map_bounds["min_lat"]
+            b_lat_max = self.map_bounds["max_lat"]
+            b_lon_min = self.map_bounds["min_lon"]
+            b_lon_max = self.map_bounds["max_lon"]
+            lat_min = max(lat_min, b_lat_min)
+            lat_max = min(lat_max, b_lat_max)
+            lon_min = max(lon_min, b_lon_min)
+            lon_max = min(lon_max, b_lon_max)
+            # Если окно камеры вообще не пересекается с картой (не должно
+            # случаться благодаря _clamp_map_view, но на всякий случай) —
+            # откатываемся к полным границам, чтобы не было деления на 0.
+            if lat_min >= lat_max or lon_min >= lon_max:
+                lat_min, lat_max = b_lat_min, b_lat_max
+                lon_min, lon_max = b_lon_min, b_lon_max
         return lat_min, lat_max, lon_min, lon_max
 
     def _clamp_map_view(self):
-        """Не даёт камере полностью уйти за пределы загруженной карты."""
+        """Не даёт центру камеры уйти за пределы загруженной карты."""
         if not self.map_bounds:
             return
         self.map_view_lat = min(max(self.map_view_lat, self.map_bounds["min_lat"]), self.map_bounds["max_lat"])
         self.map_view_lon = min(max(self.map_view_lon, self.map_bounds["min_lon"]), self.map_bounds["max_lon"])
 
     def _map_image_subsurface_for_view(self, lat_min, lat_max, lon_min, lon_max):
-        """Вырезает и масштабирует нужный фрагмент карты под текущее окно камеры."""
+        """Вырезает из полного изображения карты фрагмент, соответствующий
+        текущему окну камеры (lat/lon-границам), и масштабирует его на весь
+        рендер-экран. Раньше карта всегда блитилась целиком в (0,0) без
+        обрезки — поэтому стрелки/зум визуально ничего не меняли."""
         if not self.map_image:
             return None
         if not self.map_bounds:
-            return self.map_image
+            # Нет привязки — не можем вычислить какой фрагмент показывать,
+            # показываем изображение целиком, растянутым на левую колонку.
+            return pygame.transform.smoothscale(self.map_image, (self.map_viewport_w, self.map_viewport_h))
 
         img_w, img_h = self.map_image.get_size()
-        b_lat_min, b_lat_max = self.map_bounds["min_lat"], self.map_bounds["max_lat"]
-        b_lon_min, b_lon_max = self.map_bounds["min_lon"], self.map_bounds["max_lon"]
+        b_lat_min = self.map_bounds["min_lat"]
+        b_lat_max = self.map_bounds["max_lat"]
+        b_lon_min = self.map_bounds["min_lon"]
+        b_lon_max = self.map_bounds["max_lon"]
 
-        x1 = (lon_min - b_lon_min) / (b_lon_max - b_lon_min) * img_w
-        x2 = (lon_max - b_lon_min) / (b_lon_max - b_lon_min) * img_w
-        y1 = (b_lat_max - lat_max) / (b_lat_max - b_lat_min) * img_h
-        y2 = (b_lat_max - lat_min) / (b_lat_max - b_lat_min) * img_h
+        lat_span = (b_lat_max - b_lat_min) or 1e-9
+        lon_span = (b_lon_max - b_lon_min) or 1e-9
+
+        x1 = (lon_min - b_lon_min) / lon_span * img_w
+        x2 = (lon_max - b_lon_min) / lon_span * img_w
+        y1 = (b_lat_max - lat_max) / lat_span * img_h
+        y2 = (b_lat_max - lat_min) / lat_span * img_h
 
         x1, x2 = sorted((x1, x2))
         y1, y2 = sorted((y1, y2))
@@ -1119,29 +1170,58 @@ lib_vault_network.so (v1.4.0)
 
         try:
             crop = self.map_image.subsurface((x1, y1, x2 - x1, y2 - y1))
-            return pygame.transform.smoothscale(crop.copy(), (RENDER_W, RENDER_H))
+            return pygame.transform.smoothscale(crop.copy(), (self.map_viewport_w, self.map_viewport_h))
         except ValueError:
-            return self.map_image
-    
+            return pygame.transform.smoothscale(self.map_image, (self.map_viewport_w, self.map_viewport_h))
+
     def _world_to_screen(self, lat, lon):
+        """
+        Преобразует мировые координаты в АБСОЛЮТНЫЕ координаты render_surface
+        (т.е. уже с учётом смещения левой колонки карты), используя
+        ТЕКУЩЕЕ окно камеры (см. _get_effective_bounds) — то же самое окно,
+        что используется для вырезания картинки карты, поэтому отметки
+        больше не "уезжают" относительно неподвижного фона.
+        """
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
+
+        # Проверяем, что точка в пределах текущего окна камеры
         if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
             return None, None
-        margin = 20
-        screen_w = RENDER_W - margin * 2
-        screen_h = RENDER_H - margin * 2
-        x = margin + ((lon - lon_min) / (lon_max - lon_min)) * screen_w
-        y = margin + ((lat_max - lat) / (lat_max - lat_min)) * screen_h
+
+        screen_w = self.map_viewport_w - MAP_INNER_MARGIN * 2
+        screen_h = self.map_viewport_h - MAP_INNER_MARGIN * 2
+
+        x = self.map_viewport_x + MAP_INNER_MARGIN + ((lon - lon_min) / (lon_max - lon_min)) * screen_w
+        y = self.map_viewport_y + MAP_INNER_MARGIN + ((lat_max - lat) / (lat_max - lat_min)) * screen_h
+
         return int(x), int(y)
 
     def _screen_to_world(self, screen_x, screen_y):
+        """
+        Преобразует АБСОЛЮТНЫЕ координаты render_surface в мировые —
+        также через текущее окно камеры и с учётом смещения левой колонки.
+        """
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
-        margin = 20
-        screen_w = RENDER_W - margin * 2
-        screen_h = RENDER_H - margin * 2
-        lat = lat_max - ((screen_y - margin) / screen_h) * (lat_max - lat_min)
-        lon = lon_min + ((screen_x - margin) / screen_w) * (lon_max - lon_min)
+
+        screen_w = self.map_viewport_w - MAP_INNER_MARGIN * 2
+        screen_h = self.map_viewport_h - MAP_INNER_MARGIN * 2
+
+        rel_x = screen_x - self.map_viewport_x - MAP_INNER_MARGIN
+        rel_y = screen_y - self.map_viewport_y - MAP_INNER_MARGIN
+
+        lat = lat_max - (rel_y / screen_h) * (lat_max - lat_min)
+        lon = lon_min + (rel_x / screen_w) * (lon_max - lon_min)
+
         return lat, lon
+
+    def _clamp_map_cursor(self):
+        """Не даёт прицелу выйти за пределы текущего видимого окна камеры —
+        иначе он окажется за границей левой колонки и станет невидимым."""
+        if self.map_cursor_lat is None or self.map_cursor_lon is None:
+            return
+        lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
+        self.map_cursor_lat = min(max(self.map_cursor_lat, lat_min), lat_max)
+        self.map_cursor_lon = min(max(self.map_cursor_lon, lon_min), lon_max)
 
     def _enter_map(self):
         """Вход в раздел Карта"""
@@ -1155,69 +1235,194 @@ lib_vault_network.so (v1.4.0)
         self.map_selected_marker = None
         self.map_route_target = None
         self.map_marker_input = ""
+        self.map_pending_marker_latlon = None
+        self.map_cursor_lat = None
+        self.map_cursor_lon = None
         self.output.clear()
-        self.output.push("=== КАРТА ОКРЕСТНОСТЕЙ ===\n")
-        self.output.push("Управление:\n")
-        self.output.push("[←→↑↓] - перемещение [+/-] - масштаб [Enter] - отметка\n")
-        self.output.push("[R] - маршрут [Esc] - выход\n")
+        # Подсказки по управлению теперь выводятся в сайдбаре динамически
+        # (см. _map_hint_lines) — здесь только короткое сообщение о входе.
+        self.output.push("Карта окрестностей загружена.\n", instant=True)
 
     def _render_map(self, surf):
+        """Рендерит саму карту — только в левой (широкой) колонке рабочей
+        области. Статус, подсказки и системный текст выводятся отдельно,
+        в правой колонке — см. _render_map_sidebar."""
+        # Текущее окно камеры — используется и для вырезания картинки, и
+        # для расчёта позиций отметок, чтобы всё двигалось синхронно.
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
 
+        # Рисуем карту — вырезанный и растянутый под текущий вид фрагмент
         view_surf = self._map_image_subsurface_for_view(lat_min, lat_max, lon_min, lon_max)
         if view_surf:
-            surf.blit(view_surf, (0, 0))
+            surf.blit(view_surf, (self.map_viewport_x, self.map_viewport_y))
         else:
-            surf.fill((10, 20, 10))
+            pygame.draw.rect(
+                surf, (10, 20, 10),
+                (self.map_viewport_x, self.map_viewport_y, self.map_viewport_w, self.map_viewport_h),
+            )
             text = self.font.render("Карта не загружена", True, COLOR_TEXT)
-            surf.blit(text, (RENDER_W//2 - text.get_width()//2, RENDER_H//2))
+            surf.blit(text, (
+                self.map_viewport_x + self.map_viewport_w // 2 - text.get_width() // 2,
+                self.map_viewport_y + self.map_viewport_h // 2,
+            ))
 
+        # Рисуем отметки — попадающие в то же самое окно камеры
         visible_markers = self.map_markers.get_markers_in_view(lat_min, lat_max, lon_min, lon_max)
-    
+
         for marker in visible_markers:
             x, y = self._world_to_screen(marker.lat, marker.lon)
             if x is None:
                 continue
-        
+
             # Рисуем кружок (amber)
             radius = 6
             pygame.draw.circle(surf, (255, 200, 50, 180), (x, y), radius)
             pygame.draw.circle(surf, (255, 200, 50), (x, y), radius, 1)
-        
-            # Подпись
+
+            # Подпись — с полупрозрачной серой подложкой, иначе текст
+            # сливается с картой на светлых участках.
             label = marker.text[:20]
             label_surf = self.font.render(label, True, (255, 200, 50))
-            surf.blit(label_surf, (x + radius + 4, y - label_surf.get_height()//2))
-    
-        # Рисуем маршрут
+            label_x = x + radius + 4
+            label_y = y - label_surf.get_height() // 2
+            backing = pygame.Surface((label_surf.get_width() + 8, label_surf.get_height() + 4), pygame.SRCALPHA)
+            backing.fill((40, 40, 40, 175))
+            surf.blit(backing, (label_x - 4, label_y - 2))
+            surf.blit(label_surf, (label_x, label_y))
+
+        # Рисуем маршрут — от текущей позиции (терминал, красная стрелка),
+        # а не от центра камеры: камера может смотреть куда угодно, а
+        # маршрут по смыслу всегда прокладывается от места, где мы есть.
         if self.map_route_target:
             tx, ty = self._world_to_screen(self.map_route_target.lat, self.map_route_target.lon)
             if tx is not None:
-                # Пунктирная линия от центра
-                cx, cy = self._world_to_screen(self.map_view_lat, self.map_view_lon)
+                cx, cy = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
                 if cx is not None:
                     self._draw_dashed_line(surf, (cx, cy), (tx, ty), (255, 50, 50))
-    
+
         # Рисуем позицию терминала (красная стрелка)
         tx, ty = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
         if tx is not None:
             self._draw_terminal_marker(surf, tx, ty)
-    
-        # Отображаем подсказки
-        y = RENDER_H - 30
-        hint = f"Позиция: {self.map_view_lat:.4f}, {self.map_view_lon:.4f} | Зум: {self.map_zoom:.3f}"
-        hint_surf = self.font.render(hint, True, COLOR_DIM)
-        surf.blit(hint_surf, (10, y))
-    
-        # Отображаем информацию о выбранной отметке
-        if self.map_selected_marker:
-            info = f"Выбрано: {self.map_selected_marker.text}"
-            info_surf = self.font.render(info, True, COLOR_HIGHLIGHT)
-            surf.blit(info_surf, (RENDER_W - info_surf.get_width() - 10, y))
-    
-        # Если вводим текст отметки
+
+        # Прицел: виден во время наведения (CURSOR_MARKER/CURSOR_ROUTE), а
+        # также "заморожен" на подтверждённой точке во время ввода
+        # названия отметки (ADD_MARKER_TEXT) — чтобы было видно, куда
+        # именно она встанет.
+        if self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
+            cx, cy = self._world_to_screen(self.map_cursor_lat, self.map_cursor_lon)
+            if cx is not None:
+                self._draw_crosshair(surf, cx, cy, COLOR_HIGHLIGHT)
+        elif self.map_state == "ADD_MARKER_TEXT" and self.map_pending_marker_latlon:
+            lat, lon = self.map_pending_marker_latlon
+            cx, cy = self._world_to_screen(lat, lon)
+            if cx is not None:
+                self._draw_crosshair(surf, cx, cy, COLOR_HIGHLIGHT)
+
+    def _draw_crosshair(self, surf, x, y, color):
+        """Рисует прицел для выбора точки на карте — единая визуализация
+        и для установки отметки, и для выбора точки маршрута."""
+        radius = 10
+        gap = 4
+        tick = 7
+        pygame.draw.circle(surf, color, (x, y), radius, 2)
+        pygame.draw.circle(surf, color, (x, y), 2)
+        for dx, dy in ((0, -1), (0, 1), (-1, 0), (1, 0)):
+            start = (x + dx * (radius + gap), y + dy * (radius + gap))
+            end = (x + dx * (radius + gap + tick), y + dy * (radius + gap + tick))
+            pygame.draw.line(surf, color, start, end, 2)
+
+    def _map_hint_lines(self):
+        """Короткие строки подсказки/статуса для сайдбара — зависят от
+        текущего под-режима карты (обзор / наведение прицела / ввод
+        названия отметки)."""
+        lines = [
+            f"Поз: {self.map_view_lat:.4f}, {self.map_view_lon:.4f}",
+            f"Зум: {self.map_zoom:.4f}",
+            "",
+        ]
+        if self.map_state == "VIEW":
+            lines += [
+                "[←→↑↓] — передвижение",
+                "[+/-] — масштаб",
+                "[M] — отметка",
+                "[R] — маршрут",
+                "[Esc] — выход",
+            ]
+        elif self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
+            lines += [
+                "[←→↑↓] — передвижение",
+                "[Enter] — подтвердить",
+                "[Esc] — отмена",
+            ]
+        elif self.map_state == "ADD_MARKER_TEXT":
+            lines += [
+                "Введите текст",
+                "[Enter] — сохранить",
+                "[Esc] — отмена",
+            ]
+        return lines
+
+    def _wrap_line_for_sidebar(self, line, max_chars):
+        """Переносит одну логическую строку под ширину узкой колонки."""
+        if not line:
+            return [""]
+        return textwrap.wrap(line, width=max_chars, break_long_words=True, break_on_hyphens=False) or [""]
+
+    def _render_map_sidebar(self, surf):
+        """Правая узкая колонка карты: подсказки по управлению и статус
+        сверху (пересчитываются каждый кадр), ниже — системный текст и
+        журнал сообщений, который прокручивается вверх по мере накопления
+        (всегда показываем самый свежий хвост, без ручной прокрутки —
+        стрелки в этом экране заняты камерой/прицелом)."""
+        line_h = self.font.get_linesize() + LINE_SPACING
+        pad = 10
+        x, y, w, h = self.map_sidebar_x, self.map_sidebar_y, self.map_sidebar_w, self.map_sidebar_h
+
+        panel = pygame.Surface((w, h), pygame.SRCALPHA)
+        panel.fill((0, 0, 0, 150))
+        surf.blit(panel, (x, y))
+
+        inner_x = x + pad
+        inner_w = w - pad * 2
+        char_w = self.font.size("M")[0] or 10
+        max_chars = max(8, inner_w // char_w)
+
+        ty = y + pad
+        for line in self._map_hint_lines():
+            for wrapped in self._wrap_line_for_sidebar(line, max_chars):
+                self.render_ansi_text(surf, wrapped, inner_x, ty)
+                ty += line_h
+
+        ty += line_h // 2
+        pygame.draw.line(surf, COLOR_DIM, (inner_x, ty), (x + w - pad, ty), 1)
+        ty += line_h // 2
+
+        log_top = ty
+        log_bottom = y + h - pad
         if self.map_state == "ADD_MARKER_TEXT":
-            self._render_marker_input(surf)
+            log_bottom -= line_h * 2  # резервируем место под строку ввода названия
+
+        available_rows = max(1, (log_bottom - log_top) // line_h)
+
+        wrapped_log = []
+        for line in self.output.lines:
+            wrapped_log.extend(self._wrap_line_for_sidebar(line, max_chars))
+        visible_log = wrapped_log[-available_rows:]
+
+        ly = log_top
+        for line in visible_log:
+            self.render_ansi_text(surf, line, inner_x, ly)
+            ly += line_h
+
+        if self.map_state == "ADD_MARKER_TEXT":
+            input_y = y + h - pad - line_h * 2
+            title_surf = self.font.render("Название отметки:", True, COLOR_TEXT)
+            surf.blit(title_surf, (inner_x, input_y))
+            cursor = "_" if self.cursor_visible else " "
+            input_line = "> " + self.map_marker_input + cursor
+            wrapped_input = self._wrap_line_for_sidebar(input_line, max_chars)
+            self.render_ansi_text(surf, wrapped_input[-1], inner_x, input_y + line_h)
 
     def _draw_dashed_line(self, surf, start, end, color, dash_length=10, gap_length=10):
         """Рисует пунктирную линию"""
@@ -1248,36 +1453,6 @@ lib_vault_network.so (v1.4.0)
         ]
         pygame.draw.polygon(surf, (255, 50, 50), points)
         pygame.draw.polygon(surf, (255, 100, 100), points, 1)
-
-    def _render_marker_input(self, surf):
-        """Рендерит ввод текста отметки"""
-        # Полупрозрачный фон
-        overlay = pygame.Surface((RENDER_W, RENDER_H), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 180))
-        surf.blit(overlay, (0, 0))
-    
-        # Поле ввода
-        box_x = RENDER_W//2 - 200
-        box_y = RENDER_H//2 - 80
-        box_w = 400
-        box_h = 160
-    
-        pygame.draw.rect(surf, (69, 255, 90), (box_x, box_y, box_w, box_h), 2)
-        pygame.draw.rect(surf, (4, 10, 4), (box_x+2, box_y+2, box_w-4, box_h-4))
-    
-        # Заголовок
-        title = self.font.render("ВВЕДИТЕ ТЕКСТ ОТМЕТКИ", True, COLOR_TEXT)
-        surf.blit(title, (RENDER_W//2 - title.get_width()//2, box_y + 10))
-    
-        # Текст ввода
-        cursor = "_" if self.cursor_visible else " "
-        input_text = self.map_marker_input + cursor
-        input_surf = self.font.render(input_text[:40], True, COLOR_TEXT)
-        surf.blit(input_surf, (box_x + 20, box_y + 50))
-    
-        # Подсказка
-        hint = self.font.render("Enter - подтвердить | Esc - отмена", True, COLOR_DIM)
-        surf.blit(hint, (RENDER_W//2 - hint.get_width()//2, box_y + 100))
 
     # ---------------------------------------------------------------- boot
     def _boot(self):
@@ -2843,68 +3018,6 @@ lib_vault_network.so (v1.4.0)
             self._enter_chat_menu()
             return
 
-        if self.state == self.STATE_MAP:
-            # Если мы в режиме ввода текста отметки
-            if self.map_state == "ADD_MARKER_TEXT":
-                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
-                if text:
-                    # Добавляем отметку в центре экрана
-                    center_x = RENDER_W // 2
-                    center_y = RENDER_H // 2
-                    lat, lon = self._screen_to_world(center_x, center_y)
-                    self.map_markers.add_marker(lat, lon, text)
-                    self._play("complete")
-                    self.output.push(f"\nОтметка добавлена: {text}\n")
-                else:
-                    self._play("error")
-                    self.output.push("\nТекст не может быть пустым\n")
-                self.map_state = "VIEW"
-                self.map_marker_input = ""
-                return
-        
-            # Обработка команд карты (когда НЕ в режиме ввода текста)
-            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
-        
-            # Команда 'r' — проложить маршрут
-            if text.lower() == "r":
-                if self.map_selected_marker:
-                    self.map_route_target = self.map_selected_marker
-                    self._play("complete")
-                    self.output.push(f"\nМаршрут проложен до: {self.map_selected_marker.text}\n")
-                else:
-                    self._play("error")
-                    self.output.push("\nСначала выберите отметку (цифрой)\n")
-                return
-        
-            # Цифры — выбор отметки по номеру
-            if text.isdigit():
-                idx = int(text) - 1
-                # Получаем все видимые отметки
-                if self.map_bounds:
-                    lat_min = self.map_bounds["min_lat"]
-                    lat_max = self.map_bounds["max_lat"]
-                    lon_min = self.map_bounds["min_lon"]
-                    lon_max = self.map_bounds["max_lon"]
-                    visible_markers = self.map_markers.get_markers_in_view(lat_min, lat_max, lon_min, lon_max)
-                
-                    if 0 <= idx < len(visible_markers):
-                        self.map_selected_marker = visible_markers[idx]
-                        self._play("clack")
-                        self.output.push(f"\nВыбрана отметка: {self.map_selected_marker.text}\n")
-                        return
-            
-                # Если дошли сюда — отметка не найдена
-                self._play("error")
-                self.output.push(f"\nОтметка с номером {text} не найдена\n")
-                return
-        
-        # Если ничего не подошло
-        self._play("error")
-        self.output.push("\nНеизвестная команда. Используйте:\n")
-        self.output.push("  [цифра] - выбрать отметку\n")
-        self.output.push("  R - проложить маршрут\n")
-        return
-
     def _handle_main_menu(self, text):
         if text == "0":
             self.state = self.STATE_CLOSING
@@ -2964,50 +3077,113 @@ lib_vault_network.so (v1.4.0)
                     self._disk_reader_copy_selected()
                 return
             if self.state == self.STATE_MAP:
+                # Esc всегда отменяет ТЕКУЩИЙ под-режим карты, а не сразу
+                # закрывает раздел — иначе случайно нажатый Esc во время
+                # наведения прицела или ввода названия выкидывал бы в
+                # главное меню, теряя начатое действие.
                 if event.key == pygame.K_ESCAPE:
                     self._play("clack")
-                    self._enter_main_menu()
-                elif event.key == pygame.K_UP:
-                    self.map_view_lat += self.map_zoom * 0.1
-                    self._clamp_map_view()
-                elif event.key == pygame.K_DOWN:
-                    self.map_view_lat -= self.map_zoom * 0.1
-                    self._clamp_map_view()
-                elif event.key == pygame.K_LEFT:
-                    self.map_view_lon -= self.map_zoom * 0.1
-                    self._clamp_map_view()
-                elif event.key == pygame.K_RIGHT:
-                    self.map_view_lon += self.map_zoom * 0.1
-                    self._clamp_map_view()
-                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
-                    self.map_zoom = max(0.001, self.map_zoom * 0.9)
-                elif event.key == pygame.K_MINUS:
-                    self.map_zoom = min(0.5, self.map_zoom * 1.1)
-                elif event.key == pygame.K_RETURN:
-                    if self.map_state == "ADD_MARKER_TEXT":
-                        if self.map_marker_input:
-                            # Добавляем отметку в центре экрана
-                            center_x = RENDER_W // 2
-                            center_y = RENDER_H // 2
-                            lat, lon = self._screen_to_world(center_x, center_y)
-                            self.map_markers.add_marker(lat, lon, self.map_marker_input)
-                            self._play("complete")
+                    if self.map_state == "VIEW":
+                        self._enter_main_menu()
+                    else:
                         self.map_state = "VIEW"
                         self.map_marker_input = ""
-                    else:
-                        self.map_state = "ADD_MARKER_TEXT"
-                        self.map_marker_input = ""
+                        self.map_pending_marker_latlon = None
+                        self.map_cursor_lat = None
+                        self.map_cursor_lon = None
+                    return
+
+                if self.map_state == "VIEW":
+                    # Обычный просмотр: стрелки двигают камеру, +/- — зум,
+                    # M/R запускают наведение прицела (единая логика для
+                    # отметки и маршрута — см. ниже), подтверждение в обоих
+                    # случаях — Enter.
+                    if event.key == pygame.K_UP:
+                        self.map_view_lat += self.map_zoom * 0.1
+                        self._clamp_map_view()
+                    elif event.key == pygame.K_DOWN:
+                        self.map_view_lat -= self.map_zoom * 0.1
+                        self._clamp_map_view()
+                    elif event.key == pygame.K_LEFT:
+                        self.map_view_lon -= self.map_zoom * 0.1
+                        self._clamp_map_view()
+                    elif event.key == pygame.K_RIGHT:
+                        self.map_view_lon += self.map_zoom * 0.1
+                        self._clamp_map_view()
+                    elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+                        self.map_zoom = max(0.001, self.map_zoom * 0.9)
+                    elif event.key == pygame.K_MINUS:
+                        self.map_zoom = min(0.5, self.map_zoom * 1.1)
+                    elif event.key == pygame.K_m:
+                        self.map_state = "CURSOR_MARKER"
+                        self.map_cursor_lat = self.map_view_lat
+                        self.map_cursor_lon = self.map_view_lon
                         self._play("clack")
-                elif event.key == pygame.K_r:
-                    if self.map_selected_marker:
-                        self.map_route_target = self.map_selected_marker
-                        self._play("complete")
-                    else:
-                        self._play("error")
-                elif event.unicode and event.unicode.isprintable() and self.map_state == "ADD_MARKER_TEXT":
-                    self.map_marker_input += event.unicode
-                elif event.key == pygame.K_BACKSPACE and self.map_state == "ADD_MARKER_TEXT":
-                    self.map_marker_input = self.map_marker_input[:-1]
+                    elif event.key == pygame.K_r:
+                        self.map_state = "CURSOR_ROUTE"
+                        self.map_cursor_lat = self.map_view_lat
+                        self.map_cursor_lon = self.map_view_lon
+                        self._play("clack")
+                    return
+
+                if self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
+                    # Наведение прицела: стрелки двигают саму точку выбора
+                    # (не камеру), Enter фиксирует её.
+                    step = self.map_zoom * MAP_CURSOR_STEP_FACTOR
+                    if event.key == pygame.K_UP:
+                        self.map_cursor_lat += step
+                        self._clamp_map_cursor()
+                    elif event.key == pygame.K_DOWN:
+                        self.map_cursor_lat -= step
+                        self._clamp_map_cursor()
+                    elif event.key == pygame.K_LEFT:
+                        self.map_cursor_lon -= step
+                        self._clamp_map_cursor()
+                    elif event.key == pygame.K_RIGHT:
+                        self.map_cursor_lon += step
+                        self._clamp_map_cursor()
+                    elif event.key == pygame.K_RETURN:
+                        if self.map_state == "CURSOR_MARKER":
+                            # Для отметки координаты фиксируем сразу, а сам
+                            # текст запрашиваем следующим шагом.
+                            self.map_pending_marker_latlon = (self.map_cursor_lat, self.map_cursor_lon)
+                            self.map_state = "ADD_MARKER_TEXT"
+                            self.map_marker_input = ""
+                            self._play("clack")
+                        else:
+                            # Для маршрута название не нужно — точка не
+                            # сохраняется на диск как обычная отметка,
+                            # это временный ориентир для пунктирной линии.
+                            self.map_route_target = MapMarker(
+                                self.map_cursor_lat, self.map_cursor_lon, "Точка маршрута"
+                            )
+                            self.output.push("\nМаршрут проложен до выбранной точки.\n", instant=True)
+                            self._play("complete")
+                            self.map_state = "VIEW"
+                            self.map_cursor_lat = None
+                            self.map_cursor_lon = None
+                    return
+
+                if self.map_state == "ADD_MARKER_TEXT":
+                    if event.key == pygame.K_RETURN:
+                        if self.map_marker_input and self.map_pending_marker_latlon:
+                            lat, lon = self.map_pending_marker_latlon
+                            self.map_markers.add_marker(lat, lon, self.map_marker_input)
+                            self.output.push(f"\nОтметка добавлена: {self.map_marker_input}\n", instant=True)
+                            self._play("complete")
+                        else:
+                            self.output.push("\nТекст не может быть пустым, отметка не добавлена.\n", instant=True)
+                            self._play("error")
+                        self.map_state = "VIEW"
+                        self.map_marker_input = ""
+                        self.map_pending_marker_latlon = None
+                        self.map_cursor_lat = None
+                        self.map_cursor_lon = None
+                    elif event.key == pygame.K_BACKSPACE:
+                        self.map_marker_input = self.map_marker_input[:-1]
+                    elif event.unicode and event.unicode.isprintable():
+                        self.map_marker_input += event.unicode
+                    return
                 return
             if event.key == pygame.K_ESCAPE:
                 if self.state == self.STATE_HACK_MINIGAME and self.hack_state == "ACTIVE":
@@ -3163,23 +3339,6 @@ lib_vault_network.so (v1.4.0)
         surf.blit(self.scanlines, (0, 0))
         surf.blit(self.vignette, (0, 0))
 
-    def _render_map_message_overlay(self, surf):
-        """Показывает сообщения карты (вход, выбор отметки, ошибки и т.д.) —
-        иначе self.output никогда не рендерится в режиме карты."""
-        line_h = self.font.get_linesize() + LINE_SPACING
-        lines = self.output.visible_lines(6)
-        if not lines:
-            return
-        panel_w = RENDER_W - MARGIN * 2
-        panel_h = line_h * len(lines) + 16
-        panel = pygame.Surface((panel_w, panel_h), pygame.SRCALPHA)
-        panel.fill((0, 0, 0, 170))
-        surf.blit(panel, (MARGIN, MARGIN))
-        y = MARGIN + 8
-        for line in lines:
-            self.render_ansi_text(surf, line, MARGIN + 8, y)
-            y += line_h
-
     def render(self):
         surf = self.render_surface
         surf.fill(COLOR_BG)
@@ -3201,12 +3360,12 @@ lib_vault_network.so (v1.4.0)
             return
         
         if self.state == self.STATE_MAP:
+            # Левая широкая колонка — сама карта (с прицелом при наведении).
             self._render_map(surf)
-            # Если в режиме ввода текста отметки
-            if self.map_state == "ADD_MARKER_TEXT":
-                self._render_marker_input(surf)
-            self._render_map_message_overlay(surf)
-        
+            # Правая узкая колонка — подсказки/статус и системный текст,
+            # включая поле ввода названия отметки, если оно сейчас активно.
+            self._render_map_sidebar(surf)
+
             # Применяем эффекты
             bloom = make_bloom(surf)
             surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
