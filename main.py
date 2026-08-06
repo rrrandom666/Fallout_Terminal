@@ -1158,8 +1158,8 @@ lib_vault_network.so (v1.4.0)
         self.output.clear()
         self.output.push("=== КАРТА ОКРЕСТНОСТЕЙ ===\n")
         self.output.push("Управление:\n")
-        self.output.push("Стрелки - перемещение | +/- - зум | Enter - отметить точку\n")
-        self.output.push("R - проложить маршрут | Esc - выход\n")
+        self.output.push("[←→↑↓] - перемещение [+/-] - масштаб [Enter] - отметка\n")
+        self.output.push("[R] - маршрут [Esc] - выход\n")
 
     def _render_map(self, surf):
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
