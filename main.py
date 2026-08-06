@@ -1,14 +1,23 @@
 """
-RobCo Terminal LARP
+Vault-Tec / RobCo Terminal — Pygame edition with CRT bloom/scanline effects.
 
 Запуск:
     pip install pygame
-    pip install paho-mqtt      
+    pip install paho-mqtt      # опционально, для чата с мастером по сети
     python3 main.py
 
-Сборка в отдельный exe/бинарник:
+Звук: ожидает файлы в папке media/ рядом с main.py — см. SOUND_FILES ниже.
+Если файлов нет или аудио недоступно — приложение просто работает без звука.
+
+Сборка в отдельный exe/бинарник (позже, на целевой машине):
     pip install pyinstaller
     pyinstaller --onefile --windowed --add-data "FalloutDocuments:FalloutDocuments" --add-data "media:media" main.py
+
+Управление:
+    Цифры + Enter — выбор пункта меню (как в оригинальном RobCo-терминале)
+    Стрелки вверх/вниз — прокрутка текста, если он не помещается на экран
+    Esc  — назад / отмена ввода
+    В чате с мастером: просто печатаете текст и жмёте Enter, "exit" — выход из чата
 """
 
 import os
@@ -19,12 +28,14 @@ import datetime
 import random
 import re
 import shutil
+import json
 
 import pygame
 
 # --------------------------------------------------------------------------
 # Опциональный psutil (определение подключённой флешки с модулем взлома).
-# Если библиотеки нет, есть ручной триггер (HACK_MODULE_TRIGGER_PASSWORD).
+# Если библиотеки нет — автоопределение просто выключено, остаётся
+# резервный ручной триггер (см. HACK_MODULE_TRIGGER_PASSWORD).
 # --------------------------------------------------------------------------
 try:
     import psutil
@@ -35,7 +46,9 @@ except ImportError:
 
 # --------------------------------------------------------------------------
 # Опциональный MQTT (чат с мастером). Если библиотеки нет или брокер
-# недоступен — приложениеработает в эхо-режиме.
+# недоступен — приложение не падает, а работает в локальном тестовом
+# режиме (эхо ответов), чтобы можно было разрабатывать/тестировать без
+# развёрнутой сети на полигоне.
 # --------------------------------------------------------------------------
 try:
     import paho.mqtt.client as mqtt
@@ -49,9 +62,9 @@ TERMINAL_ID = os.environ.get("VAULT_TERMINAL_ID", "terminal_1")
 TOPIC_TO_MASTER = f"vault/{TERMINAL_ID}/to_master"
 TOPIC_FROM_MASTER = f"vault/{TERMINAL_ID}/from_master"
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Конфигурация внешнего вида
-# --------------------------------------------------------------------------
+# ==========================================================================
 TEST_MODE = os.environ.get("TERMINAL_TEST_MODE") == "1"  # для автосмоук-теста, см. низ файла
 DEVMODE = os.environ.get("TERMINAL_DEVMODE", "1") == "0"  # True: пропустить пароль-игру при загрузке
 
@@ -77,9 +90,15 @@ VIGNETTE_ALPHA_MAX = 90
 TYPEWRITER_CHARS_PER_FRAME = 2
 SCROLL_STEP = 3  # строк за одно нажатие/повтор стрелки
 
-# --- Всякоразные переменные --------------------------------------
+# ==========================================================================
+# Конфигурация терминала 
+# ==========================================================================
+
+# --------------------------------------------------------------------------
+# Авторизация
+# --------------------------------------------------------------------------
 MAX_PASSWORD_ATTEMPTS = 4
-AUTH_SUCCESS_DELAY_SECONDS = 2.5   # после верного пароля, перед главным меню
+UNAUTHORIZED_USER_LABEL = "АНОНИМ"
 
 # --------------------------------------------------------------------------
 # Определение подключённых флешек 
@@ -91,18 +110,28 @@ DRIVE_POLL_INTERVAL = 1.0
 # --------------------------------------------------------------------------
 ENABLE_HACK_MODULE_DETECTION = True         # реагировать ли на маркер флешки
 HACK_MODULE_MARKER_FILENAME = "robco_hack.module"  # файл-маркер в корне флешки
-
-# Резервный ручной запуск
 HACK_MODULE_TRIGGER_PASSWORD = "ICEBREAKER"
 
-LOCKOUT_DELAY_SECONDS = 2.5        # после исчерпания попыток пароля, перед выключением
-MENU_CLOSE_DELAY_SECONDS = 2.0     # после "0. Закрыть терминал", перед выключением
-GAME_YEAR = 2276                       
-UNAUTHORIZED_USER_LABEL = "АНОНИМ"
+# --------------------------------------------------------------------------
+# Задержки
+# --------------------------------------------------------------------------
+AUTH_SUCCESS_DELAY_SECONDS = 2.5   
+LOCKOUT_DELAY_SECONDS = 2.5        
+MENU_CLOSE_DELAY_SECONDS = 2.0     
 
-# =========================================================================
+# --------------------------------------------------------------------------
+# Время
+# --------------------------------------------------------------------------
+GAME_YEAR = 2276                       
+MONTH_ABBR_RU = [
+    "ЯНВ", "ФЕВ", "МАР", "АПР", "МАЯ", "ИЮН",
+    "ИЮЛ", "АВГ", "СЕН", "ОКТ", "НОЯ", "ДЕК",
+]
+TIMEZONE_GMT3 = datetime.timezone(datetime.timedelta(hours=3))      
+
+# -------------------------------------------------------------------------
 # Учётные записи пользователей терминала
-# =========================================================================
+# -------------------------------------------------------------------------
 # "level" — уровень доступа: "user", "admin" или "owner".
 #   owner — доступ ко всем пунктам меню, включённым в настройках выше,
 #           и ко всем папкам «Журнал» всех пользователей.
@@ -116,34 +145,35 @@ USER_ACCOUNTS = [
     {"id": "lucy_maclean",  "name": "ЛЮСИ МАКЛИН",  "password": "OKEYDOKEY", "level": "user"},
     {"id": "cooper_howard", "name": "КУПЕР ГОВАРД", "password": "FAMILY",    "level": "admin"},
 ]
-
 ACCESS_LEVEL_RANK = {"user": 0, "admin": 1, "owner": 2}
-
-# Минимальный уровень доступа для пунктов меню.
 MENU_ITEM_MIN_LEVEL = {
     "door_control": "admin",
     "chat": "owner",
     "system": "admin",
+    "map": "user"
 }
-
-# Точечный доступ к конкретному пункту меню для отдельных пользователей
-# уровня user.
-# Пример: "door_control": ["lucy_maclean"].
 MENU_ITEM_EXTRA_USER_IDS = {
     "door_control": [],
     "chat": [],
     "system": [],
+    "map": []
+}
+
+SYSTEM_SUBFOLDER_LABELS = {
+    "actions": "Действия пользователей",
+    "profiles": "Профили пользователей",
+    "door_control": "Управление дверьми",
+    "chat": "Чат со S.C.O.P.E.",
+    "disk_reader": "Чтение голодисков",
+    "system": "Система",
+    "map": "Карта"
 }
 
 ACCESS_DENIED_MESSAGE = "ДОСТУП ЗАПРЕЩЁН\nНедостаточно прав"
 
-MONTH_ABBR_RU = [
-    "ЯНВ", "ФЕВ", "МАР", "АПР", "МАЯ", "ИЮН",
-    "ИЮЛ", "АВГ", "СЕН", "ОКТ", "НОЯ", "ДЕК",
-]
-TIMEZONE_GMT3 = datetime.timezone(datetime.timedelta(hours=3))
-
+# -------------------------------------------------------------------------
 # Закреплённая шапка
+# -------------------------------------------------------------------------
 HEADER_BANNER = (
     "================ ROBCO INDUSTRIES UNIFIED OPERATING SYSTEM ================\n"
     "================== COPYRIGHT 2075-2077 ROBCO INDUSTRIES ==================="
@@ -151,27 +181,33 @@ HEADER_BANNER = (
 HEADER_LINE_COUNT = len(HEADER_BANNER.split("\n")) + 1  # +1 — строка статуса (дата/пользователь)
 HEADER_GAP_LINES = 1  # пустая строка-отступ между шапкой и прокручиваемым текстом
 
-#Директории
+# -------------------------------------------------------------------------
+# Директории
+# -------------------------------------------------------------------------
 JOURNAL_DIR = "journal"
 CHAT_HISTORY_DIR = "chat_history"
 DATA_DIR = "data"
 SYSTEM_DIR = "system"
+MAP_MARKERS_DIR = "map_markers"
 
+# -------------------------------------------------------------------------
 # Включаемые модули меню
+# -------------------------------------------------------------------------
 ENABLE_DOOR_CONTROL = True
 ENABLE_CHAT = True
 ENABLE_DISK_READER = True
 ENABLE_SYSTEM = True
+ENABLE_MAP = True
 
-# -------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 # Интерфейс чтения-записи голодисков
-# -------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 DISK_READER_LINE_H_EXTRA = 4  # доп. межстрочный интервал для дерева файлов
 DISK_READER_COL_GAP = 24      # зазор между колонками терминала и голодиска
 
-#--------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # Звуки
-#--------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 SOUND_DIR = "media"
 SOUND_FILES = {
     "clicking": "FalloutSoundClicking.mp3",  # печать текста (лупом, пока идёт анимация)
@@ -196,10 +232,22 @@ SPLASH_HOLD_AT_100 = 0.6     # пауза на 100%, прежде чем пер�
 SPLASH_BAR_WIDTH = 420
 SPLASH_BAR_HEIGHT = 22
 
+#--------------------------------------------------------------------------
+# Карта
+#--------------------------------------------------------------------------
+MAP_IMAGE_PATH = os.path.join("images", "map.png")
+MAP_BOUNDS_PATH = os.path.join("images", "map_bounds.json")
+TERMINAL_LAT = 59.929407
+TERMINAL_LON = 30.368455
+MAP_ZOOM_LEVEL = 0.015
+
+COLOR_MAP_MARKER = (255, 200, 50)  
+COLOR_MAP_ROUTE = (255, 50, 50)    
+COLOR_MAP_TERMINAL = (255, 50, 50)
+
 # =========================================================================
 # Функции для мини-игры взлома
 # =========================================================================
-
 def calculate_positional_matches(guess, correct):
     """Подсчёт совпадений букв по позиции (как в классическом Fallout)."""
     guess = guess.upper()
@@ -330,9 +378,9 @@ class OutputBuffer:
         return self.scroll_offset > 0
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Системный логгер
-# --------------------------------------------------------------------------
+# ==========================================================================
 class SystemLogger:
     def __init__(self, system_dir):
         self.system_dir = system_dir
@@ -420,9 +468,146 @@ class SystemLogger:
         self.chat_logging = False
         self.log("SYSTEM", "Завершение сеанса чата со S.C.O.P.E.", is_system=True)
 
-# --------------------------------------------------------------------------
+# ===========================================================================
+# Отметки карты
+# ===========================================================================
+
+class MapMarker:
+    def __init__(self, lat, lon, text, marker_id=None):
+        self.lat = lat
+        self.lon = lon
+        self.text = text
+        self.id = marker_id or str(int(time.time() * 1000))
+    
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "lat": self.lat,
+            "lon": self.lon,
+            "text": self.text
+        }
+    
+    @classmethod
+    def from_dict(cls, data):
+        return cls(data["lat"], data["lon"], data["text"], data["id"])
+    
+    @classmethod
+    def from_file(cls, filepath):
+        """Загружает отметку из .md файла"""
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Парсим формат:
+            # ---
+            # lat: 55.7522
+            # lon: 37.6156
+            # ---
+            # Текст отметки
+            lines = content.strip().split("\n")
+            lat = None
+            lon = None
+            text = ""
+            in_header = False
+            header_ended = False
+            
+            for line in lines:
+                if line.strip() == "---":
+                    if not in_header:
+                        in_header = True
+                    else:
+                        header_ended = True
+                    continue
+                
+                if not header_ended and in_header:
+                    if "lat:" in line:
+                        lat = float(line.split(":")[1].strip())
+                    elif "lon:" in line:
+                        lon = float(line.split(":")[1].strip())
+                elif header_ended:
+                    text += line + "\n"
+            
+            text = text.strip()
+            if lat is not None and lon is not None:
+                return cls(lat, lon, text, os.path.splitext(os.path.basename(filepath))[0])
+        except Exception as e:
+            print(f"Ошибка загрузки отметки {filepath}: {e}")
+        return None
+    
+    def save(self, directory):
+        """Сохраняет отметку в .md файл"""
+        os.makedirs(directory, exist_ok=True)
+        filename = f"{self.id}.md"
+        filepath = os.path.join(directory, filename)
+        
+        content = f"""---
+lat: {self.lat:.6f}
+lon: {self.lon:.6f}
+---
+{self.text}"""
+        
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(content)
+        return filepath
+
+class MapMarkersManager:
+    def __init__(self, directory):
+        self.directory = directory
+        self.markers = []
+        self.load_markers()
+    
+    def load_markers(self):
+        """Загружает все отметки из папки"""
+        self.markers = []
+        if not os.path.exists(self.directory):
+            return
+        
+        for filename in os.listdir(self.directory):
+            if filename.endswith(".md"):
+                filepath = os.path.join(self.directory, filename)
+                marker = MapMarker.from_file(filepath)
+                if marker:
+                    self.markers.append(marker)
+    
+    def add_marker(self, lat, lon, text):
+        """Добавляет новую отметку"""
+        marker = MapMarker(lat, lon, text)
+        marker.save(self.directory)
+        self.markers.append(marker)
+        return marker
+    
+    def remove_marker(self, marker_id):
+        """Удаляет отметку по ID"""
+        for i, marker in enumerate(self.markers):
+            if marker.id == marker_id:
+                filepath = os.path.join(self.directory, f"{marker_id}.md")
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                del self.markers[i]
+                return True
+        return False
+    
+    def get_markers_in_view(self, lat_min, lat_max, lon_min, lon_max):
+        """Возвращает отметки в заданном прямоугольнике"""
+        return [m for m in self.markers 
+                if lat_min <= m.lat <= lat_max and lon_min <= m.lon <= lon_max]
+    
+    def copy_from_holotape(self, source_path):
+        """Копирует отметку с голодиска"""
+        marker = MapMarker.from_file(source_path)
+        if marker:
+            # Проверяем, нет ли уже такой отметки
+            for existing in self.markers:
+                if existing.id == marker.id:
+                    return False
+            marker.save(self.directory)
+            self.markers.append(marker)
+            return True
+        return False
+
+# ===========================================================================
 # Приложение
-# --------------------------------------------------------------------------
+# ===========================================================================
 class TerminalApp:
     STATE_SPLASH = "SPLASH"
     STATE_BOOT = "BOOT"
@@ -451,9 +636,15 @@ class TerminalApp:
     STATE_SYSTEM_PROFILE_VIEW = "SYSTEM_PROFILE_VIEW"
     STATE_SYSTEM_ACTIONS = "SYSTEM_ACTIONS"
     STATE_SYSTEM_ACTION_VIEW = "SYSTEM_ACTION_VIEW"
+    STATE_MAP = "MAP"
+    STATE_MAP_MARKER_INPUT = "MAP_MARKER_INPUT"
 
     def __init__(self):
         pygame.init()
+        # Глобальный key-repeat намеренно НЕ включаем: он повторял бы и Enter,
+        # что при удержании кнопки приводило к каскаду лишних отправок формы
+        # (пустой ввод трактуется многими меню как "0"/"назад"). Повтор нужен
+        # только для стрелок прокрутки — реализован вручную в update().
         pygame.display.set_caption("ROBCO INDUSTRIES (TM) TERMLINK")
         self.window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.render_surface = pygame.Surface((RENDER_W, RENDER_H))
@@ -511,7 +702,8 @@ class TerminalApp:
         self.current_log_owner_id = None  # чей журнал сейчас просматриваем (актуально для owner)
         self._ensure_user_journal_dirs()
 
-        # Модуль взлома 
+        # Модуль взлома (запускается только с внешней флешки; попытки —
+        # общие с обычным вводом пароля, self.password_attempts_used)
         self.hack_correct_password = ""
         self.hack_display = []
         self.hack_bonus_codes = []
@@ -522,7 +714,7 @@ class TerminalApp:
         self.hack_initial_render = True
         self.hack_restore_smiley = ""  # Какой смайл восстанавливает попытку
 
-        # Определение флешек
+        # Определение флешек — общий механизм (см. константы выше)
         self._last_drive_poll_at = 0.0
         self._known_mount_points = set()
         if PSUTIL_AVAILABLE:
@@ -539,7 +731,7 @@ class TerminalApp:
         self.disk_reader_status = ""
         self._last_disk_reader_check_at = 0.0
 
-        # Отложенные действия 
+        # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
         self._pending_callback = None
         self._pending_callback_at = None
 
@@ -553,7 +745,7 @@ class TerminalApp:
         self.running = True
         self._frame_count = 0
 
-        # Звук
+        # ---------------------------------------------------------- звук
         self.sound_enabled = True
         self.sounds = {}
         self.typing_channel = None
@@ -588,7 +780,23 @@ class TerminalApp:
         # Создаём системную папку и её структуру
         self._initialize_system_folder()
 
-    # Звук
+        # Карта
+        self.map_image = None
+        self.map_bounds = None
+        self.map_view_lat = TERMINAL_LAT
+        self.map_view_lon = TERMINAL_LON
+        self.map_zoom = MAP_ZOOM_LEVEL
+        self.map_markers = MapMarkersManager(MAP_MARKERS_DIR)
+        self.map_selected_marker = None
+        self.map_route_target = None
+        self.map_marker_input = ""
+        self.map_state = "VIEW"
+
+        # Загружаем карту
+        self._load_map_image()
+        self._load_map_bounds()
+
+    # -------------------------------------------------------------- звук
     def _play(self, name):
         if not self.sound_enabled:
             return
@@ -620,7 +828,7 @@ class TerminalApp:
             except pygame.error:
                 pass
             self._typing_loop_active = False
-    # Заставка
+    # ------------------------------------------------------------- заставка
     def _enter_splash(self):
         self.state = self.STATE_SPLASH
         self.fixed_header = False
@@ -833,6 +1041,234 @@ lib_vault_network.so (v1.4.0)
                     shutil.rmtree(os.path.join(SYSTEM_DIR, folder))
                 except OSError:
                     pass
+
+    def _load_map_image(self):
+        """Загружает изображение карты"""
+        map_path = os.path.join("images", "map.png")
+        try:
+            img = pygame.image.load(map_path)
+            self.map_image = pygame.transform.smoothscale(img, (RENDER_W, RENDER_H))
+        except (pygame.error, FileNotFoundError):
+            print(f"[карта] не удалось загрузить {map_path}")
+            self.map_image = None
+    
+    def _load_map_bounds(self):
+        """Загружает привязку карты из JSON файла"""
+        try:
+            with open(MAP_BOUNDS_PATH, 'r', encoding='utf-8') as f:
+                self.map_bounds = json.load(f)
+            print(f"[карта] загружена привязка: {self.map_bounds}")
+        
+            # Устанавливаем зум на основе границ карты
+            if self.map_bounds:
+                lat_range = self.map_bounds["max_lat"] - self.map_bounds["min_lat"]
+                lon_range = self.map_bounds["max_lon"] - self.map_bounds["min_lon"]
+                self.map_zoom = max(lat_range, lon_range) / 2
+                print(f"[карта] установлен зум: {self.map_zoom:.6f}")
+            
+        except (FileNotFoundError, json.JSONDecodeError) as e:
+            print(f"[карта] не удалось загрузить привязку {MAP_BOUNDS_PATH}: {e}")
+            self.map_bounds = None
+    
+    def _world_to_screen(self, lat, lon):
+        """
+        Преобразует мировые координаты в экранные с использованием привязки карты
+        """
+        if not self.map_bounds:
+            # Fallback: используем текущий вьюпорт
+            half_zoom = self.map_zoom
+            lat_min = self.map_view_lat - half_zoom
+            lat_max = self.map_view_lat + half_zoom
+            lon_min = self.map_view_lon - half_zoom
+            lon_max = self.map_view_lon + half_zoom
+        else:
+            # Используем реальные границы карты
+            lat_min = self.map_bounds["min_lat"]
+            lat_max = self.map_bounds["max_lat"]
+            lon_min = self.map_bounds["min_lon"]
+            lon_max = self.map_bounds["max_lon"]
+    
+        # Проверяем, что точка в пределах карты
+        if not (lat_min <= lat <= lat_max and lon_min <= lon <= lon_max):
+            return None, None
+    
+        margin = 20
+        screen_w = RENDER_W - margin * 2
+        screen_h = RENDER_H - margin * 2
+    
+        x = margin + ((lon - lon_min) / (lon_max - lon_min)) * screen_w
+        y = margin + ((lat_max - lat) / (lat_max - lat_min)) * screen_h
+    
+        return int(x), int(y)
+
+    def _screen_to_world(self, screen_x, screen_y):
+        """
+        Преобразует экранные координаты в мировые (для создания отметок в центре экрана)
+        """
+        if not self.map_bounds:
+            # Fallback: используем текущий вьюпорт
+            half_zoom = self.map_zoom
+            lat_min = self.map_view_lat - half_zoom
+            lat_max = self.map_view_lat + half_zoom
+            lon_min = self.map_view_lon - half_zoom
+            lon_max = self.map_view_lon + half_zoom
+        else:
+            lat_min = self.map_bounds["min_lat"]
+            lat_max = self.map_bounds["max_lat"]
+            lon_min = self.map_bounds["min_lon"]
+            lon_max = self.map_bounds["max_lon"]
+    
+        margin = 20
+        screen_w = RENDER_W - margin * 2
+        screen_h = RENDER_H - margin * 2
+    
+        # Преобразуем экранные координаты в мировые
+        lat = lat_max - ((screen_y - margin) / screen_h) * (lat_max - lat_min)
+        lon = lon_min + ((screen_x - margin) / screen_w) * (lon_max - lon_min)
+    
+        return lat, lon
+
+    def _enter_map(self):
+        """Вход в раздел Карта"""
+        if not self._can_access_item("map"):
+            self._deny_access()
+            return
+    
+        self.state = self.STATE_MAP
+        self.fixed_header = False
+        self.map_state = "VIEW"
+        self.map_selected_marker = None
+        self.map_route_target = None
+        self.map_marker_input = ""
+        self.output.clear()
+        self.output.push("=== КАРТА ОКРЕСТНОСТЕЙ ===\n")
+        self.output.push("Управление:\n")
+        self.output.push("Стрелки - перемещение | +/- - зум | Enter - отметить точку\n")
+        self.output.push("R - проложить маршрут | Esc - выход\n")
+
+    def _render_map(self, surf):
+        """Рендерит карту"""
+        # Рисуем карту
+        if self.map_image:
+            surf.blit(self.map_image, (0, 0))
+        else:
+            surf.fill((10, 20, 10))
+            text = self.font.render("Карта не загружена", True, COLOR_TEXT)
+            surf.blit(text, (RENDER_W//2 - text.get_width()//2, RENDER_H//2))
+    
+        # Рисуем отметки
+        half_zoom = self.map_zoom
+        lat_min = self.map_view_lat - half_zoom
+        lat_max = self.map_view_lat + half_zoom
+        lon_min = self.map_view_lon - half_zoom
+        lon_max = self.map_view_lon + half_zoom
+    
+        visible_markers = self.map_markers.get_markers_in_view(lat_min, lat_max, lon_min, lon_max)
+    
+        for marker in visible_markers:
+            x, y = self._world_to_screen(marker.lat, marker.lon)
+            if x is None:
+                continue
+        
+            # Рисуем кружок (amber)
+            radius = 6
+            pygame.draw.circle(surf, (255, 200, 50, 180), (x, y), radius)
+            pygame.draw.circle(surf, (255, 200, 50), (x, y), radius, 1)
+        
+            # Подпись
+            label = marker.text[:20]
+            label_surf = self.font.render(label, True, (255, 200, 50))
+            surf.blit(label_surf, (x + radius + 4, y - label_surf.get_height()//2))
+    
+        # Рисуем маршрут
+        if self.map_route_target:
+            tx, ty = self._world_to_screen(self.map_route_target.lat, self.map_route_target.lon)
+            if tx is not None:
+                # Пунктирная линия от центра
+                cx, cy = self._world_to_screen(self.map_view_lat, self.map_view_lon)
+                if cx is not None:
+                    self._draw_dashed_line(surf, (cx, cy), (tx, ty), (255, 50, 50))
+    
+        # Рисуем позицию терминала (красная стрелка)
+        tx, ty = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
+        if tx is not None:
+            self._draw_terminal_marker(surf, tx, ty)
+    
+        # Отображаем подсказки
+        y = RENDER_H - 30
+        hint = f"Позиция: {self.map_view_lat:.4f}, {self.map_view_lon:.4f} | Зум: {self.map_zoom:.3f}"
+        hint_surf = self.font.render(hint, True, COLOR_DIM)
+        surf.blit(hint_surf, (10, y))
+    
+        # Отображаем информацию о выбранной отметке
+        if self.map_selected_marker:
+            info = f"Выбрано: {self.map_selected_marker.text}"
+            info_surf = self.font.render(info, True, COLOR_HIGHLIGHT)
+            surf.blit(info_surf, (RENDER_W - info_surf.get_width() - 10, y))
+    
+        # Если вводим текст отметки
+        if self.map_state == "ADD_MARKER_TEXT":
+            self._render_marker_input(surf)
+
+    def _draw_dashed_line(self, surf, start, end, color, dash_length=10, gap_length=10):
+        """Рисует пунктирную линию"""
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = (dx**2 + dy**2) ** 0.5
+        if length == 0:
+            return
+    
+        steps = int(length / (dash_length + gap_length))
+        for i in range(steps):
+            t1 = i / steps
+            t2 = (i + 0.5) / steps
+            x1 = int(start[0] + dx * t1)
+            y1 = int(start[1] + dy * t1)
+            x2 = int(start[0] + dx * t2)
+            y2 = int(start[1] + dy * t2)
+            pygame.draw.line(surf, color, (x1, y1), (x2, y2), 2)
+
+    def _draw_terminal_marker(self, surf, x, y):
+        """Рисует маркер позиции терминала (красная стрелка)"""
+        size = 12
+        points = [
+            (x, y - size),
+            (x - size//2, y + size//2),
+            (x, y + size//4),
+            (x + size//2, y + size//2),
+        ]
+        pygame.draw.polygon(surf, (255, 50, 50), points)
+        pygame.draw.polygon(surf, (255, 100, 100), points, 1)
+
+    def _render_marker_input(self, surf):
+        """Рендерит ввод текста отметки"""
+        # Полупрозрачный фон
+        overlay = pygame.Surface((RENDER_W, RENDER_H), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 180))
+        surf.blit(overlay, (0, 0))
+    
+        # Поле ввода
+        box_x = RENDER_W//2 - 200
+        box_y = RENDER_H//2 - 80
+        box_w = 400
+        box_h = 160
+    
+        pygame.draw.rect(surf, (69, 255, 90), (box_x, box_y, box_w, box_h), 2)
+        pygame.draw.rect(surf, (4, 10, 4), (box_x+2, box_y+2, box_w-4, box_h-4))
+    
+        # Заголовок
+        title = self.font.render("ВВЕДИТЕ ТЕКСТ ОТМЕТКИ", True, COLOR_TEXT)
+        surf.blit(title, (RENDER_W//2 - title.get_width()//2, box_y + 10))
+    
+        # Текст ввода
+        cursor = "_" if self.cursor_visible else " "
+        input_text = self.map_marker_input + cursor
+        input_surf = self.font.render(input_text[:40], True, COLOR_TEXT)
+        surf.blit(input_surf, (box_x + 20, box_y + 50))
+    
+        # Подсказка
+        hint = self.font.render("Enter - подтвердить | Esc - отмена", True, COLOR_DIM)
+        surf.blit(hint, (RENDER_W//2 - hint.get_width()//2, box_y + 100))
 
     # ---------------------------------------------------------------- boot
     def _boot(self):
@@ -1128,8 +1564,6 @@ lib_vault_network.so (v1.4.0)
         sections = [("Данные", DATA_DIR)]
         if self._can_access_item("chat"):
             sections.append(("История чатов", CHAT_HISTORY_DIR))
-        if self._can_access_item("system"):
-            sections.append(("Система", SYSTEM_DIR))
 
         for label, root in sections:
             rows.append({"text": f"{label}/", "selectable": False, "abs": None, "rel": None})
@@ -1137,6 +1571,49 @@ lib_vault_network.so (v1.4.0)
                 if row["rel"] is not None:
                     row["rel"] = os.path.join(label, row["rel"])
                 rows.append(row)
+
+        if self._can_access_item("map"):
+            rows.append({"text": "Отметки карты/", "selectable": False, "abs": None, "rel": None})
+            if os.path.exists(MAP_MARKERS_DIR):
+                # Сортируем отметки по имени
+                markers = sorted(self.map_markers.markers, key=lambda m: m.text)
+                for marker in markers:
+                    rows.append({
+                        "text": f"  {marker.text[:30]}",
+                        "selectable": True,
+                        "abs": os.path.join(MAP_MARKERS_DIR, f"{marker.id}.md"),
+                        "rel": os.path.join("Отметки карты", f"{marker.id}.md")
+                    })
+
+        if self._can_access_item("system"):
+            # Как и для Журнала владельца, реальные имена подпапок (id
+            # компонентов, "actions", "profiles") заменяются на подписи,
+            # под которыми они показаны в системном меню — маска влияет
+            # только на отображаемый текст, а не на rel/abs.
+            rows.append({"text": "Система/", "selectable": False, "abs": None, "rel": None})
+            try:
+                sub_entries = sorted(
+                    e.name for e in os.scandir(SYSTEM_DIR)
+                    if not self._is_hidden_or_system(e.name)
+                )
+            except (FileNotFoundError, OSError):
+                sub_entries = []
+            for name in sub_entries:
+                full_path = os.path.join(SYSTEM_DIR, name)
+                if os.path.isdir(full_path):
+                    display_name = SYSTEM_SUBFOLDER_LABELS.get(name, name)
+                    rows.append({"text": f"  {display_name}/", "selectable": False, "abs": None, "rel": None})
+                    for row in self._walk_dir_rows(full_path, 2, set()):
+                        if row["rel"] is not None:
+                            row["rel"] = os.path.join("Система", name, row["rel"])
+                        rows.append(row)
+                else:
+                    rows.append({
+                        "text": f"  {name}",
+                        "selectable": True,
+                        "abs": full_path,
+                        "rel": os.path.join("Система", name),
+                    })
         return rows
 
     def _build_holotape_tree_rows(self):
@@ -1198,6 +1675,17 @@ lib_vault_network.so (v1.4.0)
                 self.disk_reader_status = "Недостаточно прав для этого раздела."
                 self._play("error")
                 return
+            if top == "Отметки карты":
+                # Копируем отметку с голодиска на терминал
+                if self.map_markers.copy_from_holotape(src_path):
+                    self.disk_reader_status = "Отметка скопирована на терминал"
+                    self._play("complete")
+                    self._disk_reader_rebuild("terminal")
+                    return
+                else:
+                    self.disk_reader_status = "Отметка уже существует или ошибка"
+                    self._play("error")
+                    return
             if top == "Журнал":
                 # Импорт всегда идёт в собственный журнал текущего
                 # пользователя — доступа на запись в чужие папки журнала
@@ -1601,8 +2089,10 @@ lib_vault_network.so (v1.4.0)
             actions.append(("Чат со S.C.O.P.E.", self._enter_chat_menu))
         if ENABLE_DISK_READER:
             actions.append(("Чтение голодисков", self._enter_disk_reader))
-        if ENABLE_SYSTEM and self._can_access_item("system"):
+        if ENABLE_SYSTEM:
             actions.append(("Система", self._enter_system_menu))
+        if ENABLE_MAP:
+            actions.append(("Карта", self._enter_map))
         for category in self._list_data_categories():
             actions.append((category, lambda c=category: self._enter_data_category(c)))
         self.main_menu_actions = actions
@@ -2344,6 +2834,68 @@ lib_vault_network.so (v1.4.0)
             self._enter_chat_menu()
             return
 
+        if self.state == self.STATE_MAP:
+            # Если мы в режиме ввода текста отметки
+            if self.map_state == "ADD_MARKER_TEXT":
+                self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+                if text:
+                    # Добавляем отметку в центре экрана
+                    center_x = RENDER_W // 2
+                    center_y = RENDER_H // 2
+                    lat, lon = self._screen_to_world(center_x, center_y)
+                    self.map_markers.add_marker(lat, lon, text)
+                    self._play("complete")
+                    self.output.push(f"\nОтметка добавлена: {text}\n")
+                else:
+                    self._play("error")
+                    self.output.push("\nТекст не может быть пустым\n")
+                self.map_state = "VIEW"
+                self.map_marker_input = ""
+                return
+        
+            # Обработка команд карты (когда НЕ в режиме ввода текста)
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+        
+            # Команда 'r' — проложить маршрут
+            if text.lower() == "r":
+                if self.map_selected_marker:
+                    self.map_route_target = self.map_selected_marker
+                    self._play("complete")
+                    self.output.push(f"\nМаршрут проложен до: {self.map_selected_marker.text}\n")
+                else:
+                    self._play("error")
+                    self.output.push("\nСначала выберите отметку (цифрой)\n")
+                return
+        
+            # Цифры — выбор отметки по номеру
+            if text.isdigit():
+                idx = int(text) - 1
+                # Получаем все видимые отметки
+                if self.map_bounds:
+                    lat_min = self.map_bounds["min_lat"]
+                    lat_max = self.map_bounds["max_lat"]
+                    lon_min = self.map_bounds["min_lon"]
+                    lon_max = self.map_bounds["max_lon"]
+                    visible_markers = self.map_markers.get_markers_in_view(lat_min, lat_max, lon_min, lon_max)
+                
+                    if 0 <= idx < len(visible_markers):
+                        self.map_selected_marker = visible_markers[idx]
+                        self._play("clack")
+                        self.output.push(f"\nВыбрана отметка: {self.map_selected_marker.text}\n")
+                        return
+            
+                # Если дошли сюда — отметка не найдена
+                self._play("error")
+                self.output.push(f"\nОтметка с номером {text} не найдена\n")
+                return
+        
+        # Если ничего не подошло
+        self._play("error")
+        self.output.push("\nНеизвестная команда. Используйте:\n")
+        self.output.push("  [цифра] - выбрать отметку\n")
+        self.output.push("  R - проложить маршрут\n")
+        return
+
     def _handle_main_menu(self, text):
         if text == "0":
             self.state = self.STATE_CLOSING
@@ -2401,6 +2953,48 @@ lib_vault_network.so (v1.4.0)
                 elif event.key == pygame.K_RETURN:
                     self._play("clack")
                     self._disk_reader_copy_selected()
+                return
+            if self.state == self.STATE_MAP:
+                if event.key == pygame.K_ESCAPE:
+                    self._play("clack")
+                    self._enter_main_menu()
+                elif event.key == pygame.K_UP:
+                    self.map_view_lat += self.map_zoom * 0.1
+                elif event.key == pygame.K_DOWN:
+                    self.map_view_lat -= self.map_zoom * 0.1
+                elif event.key == pygame.K_LEFT:
+                    self.map_view_lon -= self.map_zoom * 0.1
+                elif event.key == pygame.K_RIGHT:
+                    self.map_view_lon += self.map_zoom * 0.1
+                elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+                    self.map_zoom = max(0.001, self.map_zoom * 0.9)
+                elif event.key == pygame.K_MINUS:
+                    self.map_zoom = min(0.5, self.map_zoom * 1.1)
+                elif event.key == pygame.K_RETURN:
+                    if self.map_state == "ADD_MARKER_TEXT":
+                        if self.map_marker_input:
+                            # Добавляем отметку в центре экрана
+                            center_x = RENDER_W // 2
+                            center_y = RENDER_H // 2
+                            lat, lon = self._screen_to_world(center_x, center_y)
+                            self.map_markers.add_marker(lat, lon, self.map_marker_input)
+                            self._play("complete")
+                        self.map_state = "VIEW"
+                        self.map_marker_input = ""
+                    else:
+                        self.map_state = "ADD_MARKER_TEXT"
+                        self.map_marker_input = ""
+                        self._play("clack")
+                elif event.key == pygame.K_r:
+                    if self.map_selected_marker:
+                        self.map_route_target = self.map_selected_marker
+                        self._play("complete")
+                    else:
+                        self._play("error")
+                elif event.unicode and event.unicode.isprintable() and self.map_state == "ADD_MARKER_TEXT":
+                    self.map_marker_input += event.unicode
+                elif event.key == pygame.K_BACKSPACE and self.map_state == "ADD_MARKER_TEXT":
+                    self.map_marker_input = self.map_marker_input[:-1]
                 return
             if event.key == pygame.K_ESCAPE:
                 if self.state == self.STATE_HACK_MINIGAME and self.hack_state == "ACTIVE":
@@ -2571,6 +3165,23 @@ lib_vault_network.so (v1.4.0)
             self._render_disk_reader(surf)
             surf.blit(self.scanlines, (0, 0))
             surf.blit(self.vignette, (0, 0))
+            scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
+            self.window.blit(scaled, (0, 0))
+            pygame.display.flip()
+            return
+        
+        if self.state == self.STATE_MAP:
+            self._render_map(surf)
+            # Если в режиме ввода текста отметки
+            if self.map_state == "ADD_MARKER_TEXT":
+                self._render_marker_input(surf)
+        
+            # Применяем эффекты
+            bloom = make_bloom(surf)
+            surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+            surf.blit(self.scanlines, (0, 0))
+            surf.blit(self.vignette, (0, 0))
+        
             scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
             self.window.blit(scaled, (0, 0))
             pygame.display.flip()
