@@ -6,6 +6,7 @@ from shapely.geometry import Polygon, LineString, Point
 import numpy as np
 import os
 import json
+from math import radians, sin, cos, sqrt, atan2
 
 class OSMHandler(osmium.SimpleHandler):
     def __init__(self):
@@ -13,18 +14,27 @@ class OSMHandler(osmium.SimpleHandler):
         self.nodes = {}
         self.ways = []
         self.areas = []
-        
+        # Для графа дорог нужны не только координаты (как в self.ways —
+        # они используются для отрисовки линий на картинке), а именно
+        # ID узлов вдоль каждой дороги: только по ним можно понять, что
+        # две разные дороги пересекаются/соединяются в общей точке.
+        self.highway_ways = []
+
     def node(self, n):
         self.nodes[n.id] = (n.location.lon, n.location.lat)
-        
+
     def way(self, w):
         if 'highway' in w.tags:
             coords = []
+            node_ids = []
             for node in w.nodes:
                 if node.ref in self.nodes:
                     coords.append(self.nodes[node.ref])
+                    node_ids.append(node.ref)
             if len(coords) >= 2:
                 self.ways.append(coords)
+            if len(node_ids) >= 2:
+                self.highway_ways.append(node_ids)
         elif 'building' in w.tags or 'landuse' in w.tags:
             coords = []
             for node in w.nodes:
@@ -41,13 +51,18 @@ def extract_map_from_osm(osm_file, output_image='map_temp.png', bbox=None):
         osm_file: путь к OSM файлу
         output_image: имя выходного файла
         bbox: кортеж (min_lon, min_lat, max_lon, max_lat) для обрезки
+
+    Returns:
+        (success, bounds, handler) — handler возвращается, чтобы не
+        парсить .osm файл повторно при последующем построении графа дорог
+        (см. build_road_graph).
     """
     handler = OSMHandler()
     handler.apply_file(osm_file)
     
     if not handler.ways and not handler.areas:
         print("Не найдено дорог или зданий в файле OSM")
-        return False, None
+        return False, None, None
     
     # Определяем границы карты
     all_coords = []
@@ -58,7 +73,7 @@ def extract_map_from_osm(osm_file, output_image='map_temp.png', bbox=None):
     
     if not all_coords:
         print("Нет данных для отображения")
-        return False, None
+        return False, None, None
     
     coords_array = np.array(all_coords)
     
@@ -103,7 +118,7 @@ def extract_map_from_osm(osm_file, output_image='map_temp.png', bbox=None):
         "zoom_level": float((max_lat - min_lat) / 2)
     }
     
-    return True, bounds
+    return True, bounds, handler
 
 def falloutize_image(path_in, path_out):
     """
@@ -132,22 +147,127 @@ def save_bounds_json(bounds, output_file):
     print(f"Границы: {bounds['min_lat']:.6f}°N - {bounds['max_lat']:.6f}°N, "
           f"{bounds['min_lon']:.6f}°E - {bounds['max_lon']:.6f}°E")
 
-def process_osm_to_fallout(osm_file, output_file='fallout_map.png', 
-                           bbox=None, json_output=None):
+
+def _haversine_m(lat1, lon1, lat2, lon2):
+    """Расстояние между двумя точками на сфере (в метрах) — используется
+    как вес рёбер графа дорог."""
+    R = 6371000.0
+    phi1, phi2 = radians(lat1), radians(lat2)
+    dphi = radians(lat2 - lat1)
+    dlambda = radians(lon2 - lon1)
+    a = sin(dphi / 2) ** 2 + cos(phi1) * cos(phi2) * sin(dlambda / 2) ** 2
+    return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+
+def build_road_graph(handler, bbox=None, output_json='images/road_graph.json'):
+    """
+    Строит граф дорожной сети из тех же handler.highway_ways, что уже
+    считаны для отрисовки дорог на картинке — второй проход по .osm не
+    нужен. Граф нужен терминалу, чтобы прокладывать маршрут ПО ДОРОГАМ
+    (кратчайший путь), а не прямой линией через здания.
+
+    Формат выходного JSON:
+        {
+          "nodes": {"<id узла>": [lat, lon], ...},
+          "adjacency": {"<id узла>": {"<id соседа>": расстояние_в_метрах, ...}, ...}
+        }
+    Ключи — строки (так требует JSON), терминал при загрузке приводит их
+    обратно к числам. adjacency уже содержит рёбра в обе стороны — граф
+    неориентированный, дороги проходимы туда-обратно.
+
+    Args:
+        handler: OSMHandler, уже применённый к .osm файлу (см. extract_map_from_osm)
+        bbox: кортеж (min_lon, min_lat, max_lon, max_lat) — та же область,
+              что и на итоговой картинке; way, полностью лежащие за её
+              пределами, отбрасываются, чтобы граф не раздувался на весь
+              возможный региональный .osm-экстракт
+        output_json: путь к выходному JSON файлу
+    """
+    if bbox:
+        min_lon, min_lat, max_lon, max_lat = bbox
+    else:
+        min_lon = min_lat = max_lon = max_lat = None
+
+    def in_bbox(lon, lat):
+        if bbox is None:
+            return True
+        return min_lon <= lon <= max_lon and min_lat <= lat <= max_lat
+
+    # Оставляем только те дороги, что хотя бы частично попадают в область
+    # карты (полностью посторонние way пропускаем).
+    used_ways = [
+        node_ids for node_ids in handler.highway_ways
+        if any(in_bbox(*handler.nodes[nid]) for nid in node_ids if nid in handler.nodes)
+    ]
+
+    nodes_out = {}
+    adjacency = {}
+
+    def ensure_node(nid):
+        key = str(nid)
+        if key not in nodes_out:
+            lon, lat = handler.nodes[nid]
+            nodes_out[key] = [lat, lon]
+            adjacency[key] = {}
+        return key
+
+    edge_count = 0
+    for node_ids in used_ways:
+        prev_id = None
+        for nid in node_ids:
+            if nid not in handler.nodes:
+                # Узел вне загруженного региона (бывает на границах
+                # экстракта) — обрываем цепочку тут, дальше начнём заново.
+                prev_id = None
+                continue
+
+            cur_key = ensure_node(nid)
+
+            if prev_id is not None:
+                prev_key = ensure_node(prev_id)
+                lon1, lat1 = handler.nodes[prev_id]
+                lon2, lat2 = handler.nodes[nid]
+                dist = _haversine_m(lat1, lon1, lat2, lon2)
+                # Одна и та же пара узлов может встретиться в нескольких
+                # way (дублирующиеся/параллельные сегменты) — оставляем
+                # более короткое ребро.
+                if cur_key not in adjacency[prev_key] or adjacency[prev_key][cur_key] > dist:
+                    if cur_key not in adjacency[prev_key]:
+                        edge_count += 1
+                    adjacency[prev_key][cur_key] = dist
+                    adjacency[cur_key][prev_key] = dist
+
+            prev_id = nid
+
+    graph = {"nodes": nodes_out, "adjacency": adjacency}
+
+    with open(output_json, 'w', encoding='utf-8') as f:
+        json.dump(graph, f, ensure_ascii=False)
+
+    print(f"Граф дорог сохранён в {output_json}")
+    print(f"  Узлов: {len(nodes_out)}, рёбер: {edge_count}")
+    return graph
+
+
+def process_osm_to_fallout(osm_file, output_file='fallout_map.png',
+                           bbox=None, json_output=None, graph_output=None):
     """
     Полный процесс: OSM -> изображение -> эффект Fallout + JSON привязка
+    + граф дорог для прокладки маршрута
     
     Args:
         osm_file: путь к OSM файлу
         output_file: путь к выходному PNG файлу
         bbox: кортеж (min_lon, min_lat, max_lon, max_lat) для обрезки
-        json_output: путь к выходному JSON файлу (если None, генерируется автоматически)
+        json_output: путь к выходному JSON файлу привязки (если None, генерируется автоматически)
+        graph_output: путь к выходному JSON файлу графа дорог (если None, генерируется автоматически)
     """
     temp_file = 'temp_map.png'
     
-    # Шаг 1: Извлекаем карту из OSM
+    # Шаг 1: Извлекаем карту из OSM (один проход — handler переиспользуем
+    # ниже для графа дорог, повторно файл не читаем)
     print("Извлечение карты из OSM файла...")
-    success, bounds = extract_map_from_osm(osm_file, temp_file, bbox)
+    success, bounds, handler = extract_map_from_osm(osm_file, temp_file, bbox)
     if not success:
         return False
     
@@ -162,6 +282,17 @@ def process_osm_to_fallout(osm_file, output_file='fallout_map.png',
         json_output = f"{base_name}_bounds.json"
     
     save_bounds_json(bounds, json_output)
+
+    # Шаг 4: Строим и сохраняем граф дорог — используем ФАКТИЧЕСКИЕ
+    # границы карты (bounds), а не исходный bbox-аргумент: если bbox не
+    # был задан явно, extract_map_from_osm вычислил его сам по данным.
+    if graph_output is None:
+        base_name = os.path.splitext(output_file)[0]
+        graph_output = f"{base_name}_roads.json"
+
+    effective_bbox = (bounds["min_lon"], bounds["min_lat"], bounds["max_lon"], bounds["max_lat"])
+    print("Построение графа дорог...")
+    build_road_graph(handler, bbox=effective_bbox, output_json=graph_output)
     
     # Удаляем временный файл
     try:
@@ -172,6 +303,7 @@ def process_osm_to_fallout(osm_file, output_file='fallout_map.png',
     print(f"Готово! Файлы сохранены:")
     print(f"  - Карта: {output_file}")
     print(f"  - Привязка: {json_output}")
+    print(f"  - Граф дорог: {graph_output}")
     return True
 
 def generate_map_with_bounds(osm_file, output_dir='images', 
@@ -179,7 +311,7 @@ def generate_map_with_bounds(osm_file, output_dir='images',
                              zoom_level=None,
                              output_filename='fallout_map.png'):
     """
-    Упрощённая функция для генерации карты с привязкой
+    Упрощённая функция для генерации карты с привязкой и графом дорог
     
     Args:
         osm_file: путь к OSM файлу
@@ -196,6 +328,7 @@ def generate_map_with_bounds(osm_file, output_dir='images',
     output_png = os.path.join(output_dir, output_filename)
     base_name = os.path.splitext(output_filename)[0]
     output_json = os.path.join(output_dir, f"{base_name}_bounds.json")
+    output_graph = os.path.join(output_dir, f"{base_name}_roads.json")
     
     # Если заданы центр и зум, создаём bbox
     bbox = None
@@ -209,7 +342,7 @@ def generate_map_with_bounds(osm_file, output_dir='images',
               f"{min_lon:.6f}°E - {max_lon:.6f}°E")
     
     # Запускаем процесс
-    return process_osm_to_fallout(osm_file, output_png, bbox, output_json)
+    return process_osm_to_fallout(osm_file, output_png, bbox, output_json, output_graph)
 
 # Пример использования
 if __name__ == "__main__":

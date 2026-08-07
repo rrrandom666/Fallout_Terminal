@@ -30,6 +30,7 @@ import re
 import shutil
 import json
 import textwrap
+import heapq
 
 import pygame
 
@@ -238,6 +239,8 @@ SPLASH_BAR_HEIGHT = 22
 #--------------------------------------------------------------------------
 MAP_IMAGE_PATH = os.path.join("images", "map.png")
 MAP_BOUNDS_PATH = os.path.join("images", "map_bounds.json")
+ROAD_GRAPH_PATH = os.path.join("images", "map_roads.json")
+MAP_ROUTE_LINE_WIDTH = 4  # толщина линии маршрута — по прямой и по дорогам
 TERMINAL_LAT = 59.929407
 TERMINAL_LON = 30.368455
 MAP_ZOOM_LEVEL = 0.015
@@ -800,6 +803,10 @@ class TerminalApp:
         self.map_markers = MapMarkersManager(MAP_MARKERS_DIR)
         self.map_selected_marker = None
         self.map_route_target = None
+        # Путь по дорогам от терминала до map_route_target — список
+        # (lat, lon) вдоль узлов графа. None означает "граф недоступен
+        # или путь не найден", тогда рисуем прямую линию как раньше.
+        self.map_route_path = None
         self.map_marker_input = ""
         self.map_state = "VIEW"
         # Координаты прицела в режиме наведения (CURSOR_MARKER/CURSOR_ROUTE)
@@ -824,6 +831,7 @@ class TerminalApp:
         # Загружаем карту
         self._load_map_image()
         self._load_map_bounds()
+        self._load_road_graph()
 
     # -------------------------------------------------------------- звук
     def _play(self, name):
@@ -1101,6 +1109,84 @@ lib_vault_network.so (v1.4.0)
             print(f"[карта] не удалось загрузить привязку {MAP_BOUNDS_PATH}: {e}")
             self.map_bounds = None
 
+    def _load_road_graph(self):
+        """Загружает граф дорожно-пешеходной сети (см. falloutize_map.py
+        / build_road_graph) — используется, чтобы прокладывать маршрут
+        по реальным дорогам/тропинкам, а не по прямой через здания.
+        Если файла нет — молча остаёмся без графа, маршрут в этом случае
+        рисуется прямой линией (см. _find_road_path/_render_map)."""
+        self.road_graph_nodes = {}       # id узла -> (lat, lon)
+        self.road_graph_adjacency = {}   # id узла -> {id соседа: расстояние_в_метрах}
+        try:
+            with open(ROAD_GRAPH_PATH, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.road_graph_nodes = {
+                int(nid): (float(lat), float(lon))
+                for nid, (lat, lon) in data.get("nodes", {}).items()
+            }
+            self.road_graph_adjacency = {
+                int(nid): {int(nb): float(w) for nb, w in neighbors.items()}
+                for nid, neighbors in data.get("adjacency", {}).items()
+            }
+            print(f"[карта] граф дорог загружен: {len(self.road_graph_nodes)} узлов")
+        except (FileNotFoundError, json.JSONDecodeError, ValueError, KeyError) as e:
+            print(f"[карта] граф дорог недоступен ({ROAD_GRAPH_PATH}): {e}")
+
+    def _nearest_road_node(self, lat, lon):
+        """Ближайший узел графа к произвольной точке (обычным перебором —
+        граф локальный, узлов немного, и вызывается только один раз на
+        построение маршрута, не каждый кадр)."""
+        if not self.road_graph_nodes:
+            return None
+        best_id, best_dist = None, None
+        for nid, (nlat, nlon) in self.road_graph_nodes.items():
+            d = (nlat - lat) ** 2 + (nlon - lon) ** 2
+            if best_dist is None or d < best_dist:
+                best_id, best_dist = nid, d
+        return best_id
+
+    def _find_road_path(self, start_lat, start_lon, end_lat, end_lon):
+        """Кратчайший путь по графу дорог между двумя точками (Дейкстра).
+        Возвращает список (lat, lon) вдоль дорог, включая привязку к
+        ближайшим узлам на обоих концах, либо None, если граф не
+        загружен или узлы не соединены (разные компоненты сети)."""
+        if not self.road_graph_adjacency:
+            return None
+
+        start_id = self._nearest_road_node(start_lat, start_lon)
+        end_id = self._nearest_road_node(end_lat, end_lon)
+        if start_id is None or end_id is None:
+            return None
+        if start_id == end_id:
+            return [self.road_graph_nodes[start_id]]
+
+        dist = {start_id: 0.0}
+        prev = {}
+        visited = set()
+        heap = [(0.0, start_id)]
+        while heap:
+            d, node = heapq.heappop(heap)
+            if node in visited:
+                continue
+            visited.add(node)
+            if node == end_id:
+                break
+            for neighbor, weight in self.road_graph_adjacency.get(node, {}).items():
+                nd = d + weight
+                if nd < dist.get(neighbor, float("inf")):
+                    dist[neighbor] = nd
+                    prev[neighbor] = node
+                    heapq.heappush(heap, (nd, neighbor))
+
+        if end_id not in dist:
+            return None  # узлы лежат в разных, не соединённых частях графа
+
+        path_ids = [end_id]
+        while path_ids[-1] != start_id:
+            path_ids.append(prev[path_ids[-1]])
+        path_ids.reverse()
+        return [self.road_graph_nodes[nid] for nid in path_ids]
+
     def _get_effective_bounds(self):
         """Текущее окно камеры (позиция self.map_view_lat/lon + зум
         self.map_zoom), обрезанное по фактическим границам загруженной
@@ -1234,6 +1320,7 @@ lib_vault_network.so (v1.4.0)
         self.map_state = "VIEW"
         self.map_selected_marker = None
         self.map_route_target = None
+        self.map_route_path = None
         self.map_marker_input = ""
         self.map_pending_marker_latlon = None
         self.map_cursor_lat = None
@@ -1293,12 +1380,29 @@ lib_vault_network.so (v1.4.0)
         # Рисуем маршрут — от текущей позиции (терминал, красная стрелка),
         # а не от центра камеры: камера может смотреть куда угодно, а
         # маршрут по смыслу всегда прокладывается от места, где мы есть.
+        # Если для точки нашёлся путь по графу дорог (self.map_route_path)
+        # — рисуем сплошную ломаную по нему (пешеходный маршрут: тропинки,
+        # лестницы и т.п. тоже входят в граф). Иначе — прежняя пунктирная
+        # прямая как резервный вариант (граф не загружен или узлы лежат
+        # в разных, не соединённых частях сети).
         if self.map_route_target:
-            tx, ty = self._world_to_screen(self.map_route_target.lat, self.map_route_target.lon)
-            if tx is not None:
-                cx, cy = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
-                if cx is not None:
-                    self._draw_dashed_line(surf, (cx, cy), (tx, ty), (255, 50, 50))
+            if self.map_route_path and len(self.map_route_path) >= 2:
+                points = []
+                for lat, lon in self.map_route_path:
+                    px, py = self._world_to_screen(lat, lon)
+                    if px is not None:
+                        points.append((px, py))
+                if len(points) >= 2:
+                    pygame.draw.lines(surf, (255, 60, 60), False, points, MAP_ROUTE_LINE_WIDTH)
+            else:
+                tx, ty = self._world_to_screen(self.map_route_target.lat, self.map_route_target.lon)
+                if tx is not None:
+                    cx, cy = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
+                    if cx is not None:
+                        self._draw_dashed_line(
+                            surf, (cx, cy), (tx, ty), (255, 50, 50),
+                            dash_length=10, gap_length=8, width=MAP_ROUTE_LINE_WIDTH,
+                        )
 
         # Рисуем позицию терминала (красная стрелка)
         tx, ty = self._world_to_screen(TERMINAL_LAT, TERMINAL_LON)
@@ -1424,7 +1528,7 @@ lib_vault_network.so (v1.4.0)
             wrapped_input = self._wrap_line_for_sidebar(input_line, max_chars)
             self.render_ansi_text(surf, wrapped_input[-1], inner_x, input_y + line_h)
 
-    def _draw_dashed_line(self, surf, start, end, color, dash_length=10, gap_length=10):
+    def _draw_dashed_line(self, surf, start, end, color, dash_length=10, gap_length=10, width=2):
         """Рисует пунктирную линию"""
         dx = end[0] - start[0]
         dy = end[1] - start[1]
@@ -1440,11 +1544,12 @@ lib_vault_network.so (v1.4.0)
             y1 = int(start[1] + dy * t1)
             x2 = int(start[0] + dx * t2)
             y2 = int(start[1] + dy * t2)
-            pygame.draw.line(surf, color, (x1, y1), (x2, y2), 2)
+            pygame.draw.line(surf, color, (x1, y1), (x2, y2), width)
 
     def _draw_terminal_marker(self, surf, x, y):
-        """Рисует маркер позиции терминала (красная стрелка)"""
-        size = 12
+        """Рисует маркер позиции терминала (красная стрелка) — увеличен и
+        с более толстой светлой обводкой, чтобы не терялся на фоне карты."""
+        size = 16
         points = [
             (x, y - size),
             (x - size//2, y + size//2),
@@ -1452,7 +1557,7 @@ lib_vault_network.so (v1.4.0)
             (x + size//2, y + size//2),
         ]
         pygame.draw.polygon(surf, (255, 50, 50), points)
-        pygame.draw.polygon(surf, (255, 100, 100), points, 1)
+        pygame.draw.polygon(surf, (255, 160, 160), points, 3)
 
     # ---------------------------------------------------------------- boot
     def _boot(self):
@@ -3153,11 +3258,20 @@ lib_vault_network.so (v1.4.0)
                         else:
                             # Для маршрута название не нужно — точка не
                             # сохраняется на диск как обычная отметка,
-                            # это временный ориентир для пунктирной линии.
-                            self.map_route_target = MapMarker(
-                                self.map_cursor_lat, self.map_cursor_lon, "Точка маршрута"
+                            # это временный ориентир для линии маршрута.
+                            target_lat, target_lon = self.map_cursor_lat, self.map_cursor_lon
+                            self.map_route_target = MapMarker(target_lat, target_lon, "Точка маршрута")
+                            # Пеший маршрут по графу дорог/тропинок от
+                            # текущей позиции терминала до выбранной точки.
+                            self.map_route_path = self._find_road_path(
+                                TERMINAL_LAT, TERMINAL_LON, target_lat, target_lon
                             )
-                            self.output.push("\nМаршрут проложен до выбранной точки.\n", instant=True)
+                            if self.map_route_path:
+                                self.output.push("\nМаршрут проложен по дорогам до выбранной точки.\n", instant=True)
+                            else:
+                                self.output.push(
+                                    "\nПуть по дорогам не найден — маршрут показан по прямой.\n", instant=True
+                                )
                             self._play("complete")
                             self.map_state = "VIEW"
                             self.map_cursor_lat = None
