@@ -197,3 +197,9 @@ cython_debug/
 *_highscores.json
 .DS_Store
 *.osm
+
+system/
+map_markers/
+journal/
+chat_history/
+data/
