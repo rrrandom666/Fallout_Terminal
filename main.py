@@ -35,9 +35,7 @@ import heapq
 import pygame
 
 # --------------------------------------------------------------------------
-# Опциональный psutil (определение подключённой флешки с модулем взлома).
-# Если библиотеки нет — автоопределение просто выключено, остаётся
-# резервный ручной триггер (см. HACK_MODULE_TRIGGER_PASSWORD).
+# Определение подключённой флешки с модулем взлома
 # --------------------------------------------------------------------------
 try:
     import psutil
@@ -47,10 +45,7 @@ except ImportError:
 
 
 # --------------------------------------------------------------------------
-# Опциональный MQTT (чат с мастером). Если библиотеки нет или брокер
-# недоступен — приложение не падает, а работает в локальном тестовом
-# режиме (эхо ответов), чтобы можно было разрабатывать/тестировать без
-# развёрнутой сети на полигоне.
+# Опциональный MQTT (чат с мастером)
 # --------------------------------------------------------------------------
 try:
     import paho.mqtt.client as mqtt
@@ -134,14 +129,6 @@ TIMEZONE_GMT3 = datetime.timezone(datetime.timedelta(hours=3))
 # -------------------------------------------------------------------------
 # Учётные записи пользователей терминала
 # -------------------------------------------------------------------------
-# "level" — уровень доступа: "user", "admin" или "owner".
-#   owner — доступ ко всем пунктам меню, включённым в настройках выше,
-#           и ко всем папкам «Журнал» всех пользователей.
-#   admin — доступ ко всем пунктам меню, кроме чата со S.C.O.P.E.
-#   user  — доступ только к пунктам, формируемым папкой data/, к чтению
-#           голодисков и к собственной папке в «Журнале». Доступ к прочим
-#           пунктам (формируемым самим main.py) можно дать отдельным
-#           пользователям точечно через MENU_ITEM_EXTRA_USER_IDS ниже.
 USER_ACCOUNTS = [
     {"id": "bill_wasson",   "name": "БИЛЛ ВАССОН",  "password": "HAPPINESS", "level": "owner"},
     {"id": "lucy_maclean",  "name": "ЛЮСИ МАКЛИН",  "password": "OKEYDOKEY", "level": "user"},
@@ -249,14 +236,12 @@ COLOR_MAP_MARKER = (255, 200, 50)
 COLOR_MAP_ROUTE = (255, 50, 50)    
 COLOR_MAP_TERMINAL = (255, 50, 50)
 
-# Геометрия рабочей области карты: широкая колонка слева (сама карта) и
-# узкая колонка справа (статус/подсказки/системный текст/ввод названия).
+# Геометрия рабочей области карты
 MAP_SIDEBAR_WIDTH = 260
 MAP_COLUMN_GAP = 20
 MAP_INNER_MARGIN = 16  # отступ содержимого карты внутри левой колонки
 
-# Шаг перемещения прицела по стрелкам в режиме выбора точки — доля
-# текущего зума, чтобы на любом уровне приближения шаг был соразмерным.
+# Шаг перемещения прицела по стрелкам
 MAP_CURSOR_STEP_FACTOR = 0.08
 
 # =========================================================================
@@ -655,10 +640,6 @@ class TerminalApp:
 
     def __init__(self):
         pygame.init()
-        # Глобальный key-repeat намеренно НЕ включаем: он повторял бы и Enter,
-        # что при удержании кнопки приводило к каскаду лишних отправок формы
-        # (пустой ввод трактуется многими меню как "0"/"назад"). Повтор нужен
-        # только для стрелок прокрутки — реализован вручную в update().
         pygame.display.set_caption("ROBCO INDUSTRIES (TM) TERMLINK")
         self.window = pygame.display.set_mode((WINDOW_W, WINDOW_H))
         self.render_surface = pygame.Surface((RENDER_W, RENDER_H))
@@ -716,8 +697,7 @@ class TerminalApp:
         self.current_log_owner_id = None  # чей журнал сейчас просматриваем (актуально для owner)
         self._ensure_user_journal_dirs()
 
-        # Модуль взлома (запускается только с внешней флешки; попытки —
-        # общие с обычным вводом пароля, self.password_attempts_used)
+        # Модуль взлома
         self.hack_correct_password = ""
         self.hack_display = []
         self.hack_bonus_codes = []
@@ -745,7 +725,7 @@ class TerminalApp:
         self.disk_reader_status = ""
         self._last_disk_reader_check_at = 0.0
 
-        # Отложенные действия (даём прочитать сообщение перед переходом/выключением)
+        # Отложенные действия
         self._pending_callback = None
         self._pending_callback_at = None
 
@@ -759,7 +739,7 @@ class TerminalApp:
         self.running = True
         self._frame_count = 0
 
-        # ---------------------------------------------------------- звук
+        # Звук
         self.sound_enabled = True
         self.sounds = {}
         self.typing_channel = None
@@ -803,22 +783,17 @@ class TerminalApp:
         self.map_markers = MapMarkersManager(MAP_MARKERS_DIR)
         self.map_selected_marker = None
         self.map_route_target = None
-        # Путь по дорогам от терминала до map_route_target — список
-        # (lat, lon) вдоль узлов графа. None означает "граф недоступен
-        # или путь не найден", тогда рисуем прямую линию как раньше.
+        # Путь по дорогам
         self.map_route_path = None
         self.map_marker_input = ""
         self.map_state = "VIEW"
-        # Координаты прицела в режиме наведения (CURSOR_MARKER/CURSOR_ROUTE)
-        # и координаты, подтверждённые прицелом и ожидающие названия отметки.
+        self.map_route_state = "SELECT_MODE"  # SELECT_MODE, FROM_MARKERS, FROM_CURSOR
+        self.map_route_selected_marker = None
+        # Координаты прицела
         self.map_cursor_lat = None
         self.map_cursor_lon = None
         self.map_pending_marker_latlon = None
-
-        # Геометрия рабочей области карты: широкая колонка слева (сама
-        # карта) и узкая колонка справа (текст/ввод) — считается один раз,
-        # т.к. зависит только от констант RENDER_W/H, MARGIN и ширины
-        # сайдбара.
+        # Геометрия рабочей области карты
         self.map_viewport_x = MARGIN
         self.map_viewport_y = MARGIN
         self.map_viewport_w = RENDER_W - MARGIN * 2 - MAP_COLUMN_GAP - MAP_SIDEBAR_WIDTH
@@ -827,13 +802,12 @@ class TerminalApp:
         self.map_sidebar_y = MARGIN
         self.map_sidebar_w = MAP_SIDEBAR_WIDTH
         self.map_sidebar_h = RENDER_H - MARGIN * 2
-
         # Загружаем карту
         self._load_map_image()
         self._load_map_bounds()
         self._load_road_graph()
 
-    # -------------------------------------------------------------- звук
+    # Звук
     def _play(self, name):
         if not self.sound_enabled:
             return
@@ -846,8 +820,6 @@ class TerminalApp:
             pass
 
     def _sync_typing_loop(self, is_typing):
-        """Крутит клик-луп ('clicking'), пока идёт анимация печати текста,
-        и останавливает его, как только текст полностью показан."""
         if not self.sound_enabled or self.typing_channel is None:
             return
         snd = self.sounds.get("clicking")
@@ -865,7 +837,7 @@ class TerminalApp:
             except pygame.error:
                 pass
             self._typing_loop_active = False
-    # ------------------------------------------------------------- заставка
+    # Заставка
     def _enter_splash(self):
         self.state = self.STATE_SPLASH
         self.fixed_header = False
@@ -910,7 +882,6 @@ class TerminalApp:
         self._leave_splash()
 
     def _initialize_system_folder(self):
-        """Создаёт системную папку и её структуру согласно конфигурации."""
         if not ENABLE_SYSTEM:
             return
     
@@ -1080,7 +1051,6 @@ lib_vault_network.so (v1.4.0)
                     pass
 
     def _load_map_image(self):
-        """Загружает изображение карты"""
         map_path = os.path.join("images", "map.png")
         try:
             img = pygame.image.load(map_path)
@@ -1092,7 +1062,6 @@ lib_vault_network.so (v1.4.0)
             self.map_image = None
     
     def _load_map_bounds(self):
-        """Загружает привязку карты из JSON файла"""
         try:
             with open(MAP_BOUNDS_PATH, 'r', encoding='utf-8') as f:
                 self.map_bounds = json.load(f)
@@ -1110,11 +1079,6 @@ lib_vault_network.so (v1.4.0)
             self.map_bounds = None
 
     def _load_road_graph(self):
-        """Загружает граф дорожно-пешеходной сети (см. falloutize_map.py
-        / build_road_graph) — используется, чтобы прокладывать маршрут
-        по реальным дорогам/тропинкам, а не по прямой через здания.
-        Если файла нет — молча остаёмся без графа, маршрут в этом случае
-        рисуется прямой линией (см. _find_road_path/_render_map)."""
         self.road_graph_nodes = {}       # id узла -> (lat, lon)
         self.road_graph_adjacency = {}   # id узла -> {id соседа: расстояние_в_метрах}
         try:
@@ -1133,9 +1097,6 @@ lib_vault_network.so (v1.4.0)
             print(f"[карта] граф дорог недоступен ({ROAD_GRAPH_PATH}): {e}")
 
     def _nearest_road_node(self, lat, lon):
-        """Ближайший узел графа к произвольной точке (обычным перебором —
-        граф локальный, узлов немного, и вызывается только один раз на
-        построение маршрута, не каждый кадр)."""
         if not self.road_graph_nodes:
             return None
         best_id, best_dist = None, None
@@ -1146,10 +1107,6 @@ lib_vault_network.so (v1.4.0)
         return best_id
 
     def _find_road_path(self, start_lat, start_lon, end_lat, end_lon):
-        """Кратчайший путь по графу дорог между двумя точками (Дейкстра).
-        Возвращает список (lat, lon) вдоль дорог, включая привязку к
-        ближайшим узлам на обоих концах, либо None, если граф не
-        загружен или узлы не соединены (разные компоненты сети)."""
         if not self.road_graph_adjacency:
             return None
 
@@ -1188,11 +1145,6 @@ lib_vault_network.so (v1.4.0)
         return [self.road_graph_nodes[nid] for nid in path_ids]
 
     def _get_effective_bounds(self):
-        """Текущее окно камеры (позиция self.map_view_lat/lon + зум
-        self.map_zoom), обрезанное по фактическим границам загруженной
-        карты. Используется и для вырезания картинки, и для перевода
-        мировых координат в экранные — раньше эти два места считали
-        по-разному, из-за чего карта не двигалась, а отметки "убегали"."""
         half = self.map_zoom
         lat_min = self.map_view_lat - half
         lat_max = self.map_view_lat + half
@@ -1216,17 +1168,12 @@ lib_vault_network.so (v1.4.0)
         return lat_min, lat_max, lon_min, lon_max
 
     def _clamp_map_view(self):
-        """Не даёт центру камеры уйти за пределы загруженной карты."""
         if not self.map_bounds:
             return
         self.map_view_lat = min(max(self.map_view_lat, self.map_bounds["min_lat"]), self.map_bounds["max_lat"])
         self.map_view_lon = min(max(self.map_view_lon, self.map_bounds["min_lon"]), self.map_bounds["max_lon"])
 
     def _map_image_subsurface_for_view(self, lat_min, lat_max, lon_min, lon_max):
-        """Вырезает из полного изображения карты фрагмент, соответствующий
-        текущему окну камеры (lat/lon-границам), и масштабирует его на весь
-        рендер-экран. Раньше карта всегда блитилась целиком в (0,0) без
-        обрезки — поэтому стрелки/зум визуально ничего не меняли."""
         if not self.map_image:
             return None
         if not self.map_bounds:
@@ -1261,13 +1208,6 @@ lib_vault_network.so (v1.4.0)
             return pygame.transform.smoothscale(self.map_image, (self.map_viewport_w, self.map_viewport_h))
 
     def _world_to_screen(self, lat, lon):
-        """
-        Преобразует мировые координаты в АБСОЛЮТНЫЕ координаты render_surface
-        (т.е. уже с учётом смещения левой колонки карты), используя
-        ТЕКУЩЕЕ окно камеры (см. _get_effective_bounds) — то же самое окно,
-        что используется для вырезания картинки карты, поэтому отметки
-        больше не "уезжают" относительно неподвижного фона.
-        """
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
 
         # Проверяем, что точка в пределах текущего окна камеры
@@ -1283,10 +1223,6 @@ lib_vault_network.so (v1.4.0)
         return int(x), int(y)
 
     def _screen_to_world(self, screen_x, screen_y):
-        """
-        Преобразует АБСОЛЮТНЫЕ координаты render_surface в мировые —
-        также через текущее окно камеры и с учётом смещения левой колонки.
-        """
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
 
         screen_w = self.map_viewport_w - MAP_INNER_MARGIN * 2
@@ -1301,8 +1237,6 @@ lib_vault_network.so (v1.4.0)
         return lat, lon
 
     def _clamp_map_cursor(self):
-        """Не даёт прицелу выйти за пределы текущего видимого окна камеры —
-        иначе он окажется за границей левой колонки и станет невидимым."""
         if self.map_cursor_lat is None or self.map_cursor_lon is None:
             return
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
@@ -1310,7 +1244,6 @@ lib_vault_network.so (v1.4.0)
         self.map_cursor_lon = min(max(self.map_cursor_lon, lon_min), lon_max)
 
     def _enter_map(self):
-        """Вход в раздел Карта"""
         if not self._can_access_item("map"):
             self._deny_access()
             return
@@ -1318,6 +1251,7 @@ lib_vault_network.so (v1.4.0)
         self.state = self.STATE_MAP
         self.fixed_header = False
         self.map_state = "VIEW"
+        self.map_route_state = None
         self.map_selected_marker = None
         self.map_route_target = None
         self.map_route_path = None
@@ -1330,10 +1264,72 @@ lib_vault_network.so (v1.4.0)
         # (см. _map_hint_lines) — здесь только короткое сообщение о входе.
         self.output.push("Карта окрестностей загружена.\n", instant=True)
 
+    def _handle_map_input(self, text):
+        if self.map_state == "ROUTE_SELECT_MODE" and self.map_route_state == "SELECT_MODE":
+            if text == "0":
+                self.map_state = "VIEW"
+                self.map_route_state = None
+                self.output.push("Построение маршрута отменено.\n", instant=True)
+                return
+            elif text == "1":
+                # Выбор из отметок
+                self.map_route_state = "FROM_MARKERS"
+                self.output.push("Выберите отметку:\n", instant=True)
+                for i, marker in enumerate(self.map_markers.markers, 1):
+                    self.output.push(f"{i}. {marker.text} ({marker.lat:.4f}, {marker.lon:.4f})\n", instant=True)
+                self.output.push("0. Отмена\n", instant=True)
+                return
+            elif text == "2":
+                # Указать на карте
+                self.map_state = "CURSOR_ROUTE"
+                self.map_cursor_lat = self.map_view_lat
+                self.map_cursor_lon = self.map_view_lon
+                self._play("clack")
+                return
+            else:
+                self._play("error")
+                self.output.push("Неизвестная команда. Введите 1, 2 или 0.\n", instant=True)
+                return
+    
+        elif self.map_state == "ROUTE_SELECT_MODE" and self.map_route_state == "FROM_MARKERS":
+            if text == "0":
+                self.map_state = "VIEW"
+                self.map_route_state = None
+                self.output.push("Построение маршрута отменено.\n", instant=True)
+                return
+        
+            if not text.isdigit():
+                self._play("error")
+                self.output.push("Введите номер отметки.\n", instant=True)
+                return
+        
+            idx = int(text)
+            if not (1 <= idx <= len(self.map_markers.markers)):
+                self._play("error")
+                self.output.push("Неверный номер отметки.\n", instant=True)
+                return
+        
+            marker = self.map_markers.markers[idx - 1]
+            self.map_route_target = marker
+        
+            # Строим маршрут к выбранной отметке
+            self.map_route_path = self._find_road_path(
+                TERMINAL_LAT, TERMINAL_LON, marker.lat, marker.lon
+            )
+        
+            if self.map_route_path:
+                self.output.push(f"\nМаршрут построен до отметки: {marker.text}\n", instant=True)
+                self.output.push("Маршрут проложен по дорогам.\n", instant=True)
+            else:
+                self.output.push(f"\nМаршрут построен до отметки: {marker.text}\n", instant=True)
+                self.output.push("Путь по дорогам не найден — маршрут показан по прямой.\n", instant=True)
+        
+            self._play("complete")
+            self.map_state = "VIEW"
+            self.map_route_state = None
+            return
+
     def _render_map(self, surf):
-        """Рендерит саму карту — только в левой (широкой) колонке рабочей
-        области. Статус, подсказки и системный текст выводятся отдельно,
-        в правой колонке — см. _render_map_sidebar."""
         # Текущее окно камеры — используется и для вырезания картинки, и
         # для расчёта позиций отметок, чтобы всё двигалось синхронно.
         lat_min, lat_max, lon_min, lon_max = self._get_effective_bounds()
@@ -1377,14 +1373,7 @@ lib_vault_network.so (v1.4.0)
             surf.blit(backing, (label_x - 4, label_y - 2))
             surf.blit(label_surf, (label_x, label_y))
 
-        # Рисуем маршрут — от текущей позиции (терминал, красная стрелка),
-        # а не от центра камеры: камера может смотреть куда угодно, а
-        # маршрут по смыслу всегда прокладывается от места, где мы есть.
-        # Если для точки нашёлся путь по графу дорог (self.map_route_path)
-        # — рисуем сплошную ломаную по нему (пешеходный маршрут: тропинки,
-        # лестницы и т.п. тоже входят в граф). Иначе — прежняя пунктирная
-        # прямая как резервный вариант (граф не загружен или узлы лежат
-        # в разных, не соединённых частях сети).
+        # Рисуем маршрут
         if self.map_route_target:
             if self.map_route_path and len(self.map_route_path) >= 2:
                 points = []
@@ -1409,10 +1398,7 @@ lib_vault_network.so (v1.4.0)
         if tx is not None:
             self._draw_terminal_marker(surf, tx, ty)
 
-        # Прицел: виден во время наведения (CURSOR_MARKER/CURSOR_ROUTE), а
-        # также "заморожен" на подтверждённой точке во время ввода
-        # названия отметки (ADD_MARKER_TEXT) — чтобы было видно, куда
-        # именно она встанет.
+        # Прицел
         if self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
             cx, cy = self._world_to_screen(self.map_cursor_lat, self.map_cursor_lon)
             if cx is not None:
@@ -1424,8 +1410,6 @@ lib_vault_network.so (v1.4.0)
                 self._draw_crosshair(surf, cx, cy, COLOR_HIGHLIGHT)
 
     def _draw_crosshair(self, surf, x, y, color):
-        """Рисует прицел для выбора точки на карте — единая визуализация
-        и для установки отметки, и для выбора точки маршрута."""
         radius = 10
         gap = 4
         tick = 7
@@ -1437,9 +1421,6 @@ lib_vault_network.so (v1.4.0)
             pygame.draw.line(surf, color, start, end, 2)
 
     def _map_hint_lines(self):
-        """Короткие строки подсказки/статуса для сайдбара — зависят от
-        текущего под-режима карты (обзор / наведение прицела / ввод
-        названия отметки)."""
         lines = [
             f"Поз: {self.map_view_lat:.4f}, {self.map_view_lon:.4f}",
             f"Зум: {self.map_zoom:.4f}",
@@ -1453,9 +1434,17 @@ lib_vault_network.so (v1.4.0)
                 "[R] — маршрут",
                 "[Esc] — выход",
             ]
+        elif self.map_state == "ROUTE_SELECT_MODE":
+            lines += [
+                "=== ПОСТРОИТЬ МАРШРУТ ===",
+                "[1] — до отметки",
+                "[2] — до точки на карте",
+                "[0] — отмена",
+            ]
         elif self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
             lines += [
                 "[←→↑↓] — передвижение",
+                "[+/-] — масштаб",
                 "[Enter] — подтвердить",
                 "[Esc] — отмена",
             ]
@@ -1468,17 +1457,11 @@ lib_vault_network.so (v1.4.0)
         return lines
 
     def _wrap_line_for_sidebar(self, line, max_chars):
-        """Переносит одну логическую строку под ширину узкой колонки."""
         if not line:
             return [""]
         return textwrap.wrap(line, width=max_chars, break_long_words=True, break_on_hyphens=False) or [""]
 
     def _render_map_sidebar(self, surf):
-        """Правая узкая колонка карты: подсказки по управлению и статус
-        сверху (пересчитываются каждый кадр), ниже — системный текст и
-        журнал сообщений, который прокручивается вверх по мере накопления
-        (всегда показываем самый свежий хвост, без ручной прокрутки —
-        стрелки в этом экране заняты камерой/прицелом)."""
         line_h = self.font.get_linesize() + LINE_SPACING
         pad = 10
         x, y, w, h = self.map_sidebar_x, self.map_sidebar_y, self.map_sidebar_w, self.map_sidebar_h
@@ -1547,8 +1530,6 @@ lib_vault_network.so (v1.4.0)
             pygame.draw.line(surf, color, (x1, y1), (x2, y2), width)
 
     def _draw_terminal_marker(self, surf, x, y):
-        """Рисует маркер позиции терминала (красная стрелка) — увеличен и
-        с более толстой светлой обводкой, чтобы не терялся на фоне карты."""
         size = 16
         points = [
             (x, y - size),
@@ -1582,8 +1563,6 @@ lib_vault_network.so (v1.4.0)
             self._enter_user_select()
 
     def _ensure_user_journal_dirs(self):
-        """Создаёт папку журнала для каждого известного пользователя, чтобы
-        листинг и сохранение записей не спотыкались об отсутствующие папки."""
         for account in USER_ACCOUNTS:
             path = os.path.join(JOURNAL_DIR, account["id"])
             try:
@@ -1597,9 +1576,6 @@ lib_vault_network.so (v1.4.0)
         self.current_user_level = account["level"]
 
     def _can_access_item(self, item_key):
-        """Проверка доступа к пункту меню, формируемому самим main.py (не
-        папками data/ и journal/, и не чтением голодисков — те доступны
-        всем уровням доступа без исключений)."""
         if self.current_user_level == "owner":
             return True
         min_level = MENU_ITEM_MIN_LEVEL.get(item_key, "user")
@@ -1636,12 +1612,9 @@ lib_vault_network.so (v1.4.0)
         self.output.push(text)
         self.system_logger.start_session(self.current_user, self.current_user_id)
 
-    # ------------------------------------------------------ флешки (общее)
+    # Флешки 
     def _poll_removable_drives(self):
-        """Чисто техническое обнаружение новых смонтированных дисков — не
-        привязано к экрану пароля и ничего не знает про маркеры/модули.
-        Возвращает список путей монтирования, появившихся с прошлого опроса
-        (пустой список, если опрос ещё не пора делать или ничего нового)."""
+
         if not PSUTIL_AVAILABLE:
             return []
         now = time.time()
@@ -1656,11 +1629,8 @@ lib_vault_network.so (v1.4.0)
         self._known_mount_points = current_mounts
         return sorted(new_mounts)
 
-    # ------------------------------------------------------- модуль взлома
+    # Модуль взлома
     def _check_hack_module_on_drives(self, new_mounts):
-        """Реагирует на новые диски, только если терминал сейчас на экране
-        пароля. Само приложение не предлагает этот путь пользователю — оно
-        лишь честно замечает физическое вторжение постороннего устройства."""
         if not ENABLE_HACK_MODULE_DETECTION or self.state != self.STATE_PASSWORD:
             return
         for mount in new_mounts:
@@ -1670,12 +1640,8 @@ lib_vault_network.so (v1.4.0)
                 self._schedule(LOCKOUT_DELAY_SECONDS, self._launch_hack_module)
                 return
 
-    # ------------------------------------------------- чтение голодисков
+    # Чтение голодисков
     def _check_disk_reader_autoopen(self, new_mounts):
-        """Если игрок стоит в главном меню (ничем конкретным не занят) и
-        вставляет голодиск — сразу открываем интерфейс чтения-записи, без
-        похода в подменю. Из любого другого состояния — только вручную,
-        через пункт меню, чтобы не выдёргивать игрока посреди дела."""
         if not (ENABLE_DISK_READER and new_mounts):
             return
         if self.state != self.STATE_MAIN_MENU:
@@ -1683,7 +1649,6 @@ lib_vault_network.so (v1.4.0)
         self._enter_disk_reader()
 
     def _pick_holotape_mount(self):
-        """Находит ТЕКУЩИЙ голодиск."""
         if not PSUTIL_AVAILABLE:
             return None
     
@@ -1741,9 +1706,6 @@ lib_vault_network.so (v1.4.0)
         self._disk_reader_rebuild("holotape")
 
     def _walk_dir_rows(self, root, depth, visited=None, max_depth=3):
-        """Рекурсивно строит строки дерева для одной директории.
-        Ограничиваем глубину обхода для предотвращения зависаний.
-        Фильтруем скрытые и системные файлы/папки."""
         if visited is None:
             visited = set()
     
@@ -1822,14 +1784,6 @@ lib_vault_network.so (v1.4.0)
         return rows
 
     def _build_terminal_tree_rows(self):
-        """Строит дерево терминала для интерфейса чтения голодисков — но
-        только из тех разделов и папок, к которым у текущего пользователя
-        есть доступ. Журнал показывает только собственную папку (кроме
-        owner, которому доступны все — с именами пользователей вместо
-        технических ID папок), а История чатов не показывается вовсе,
-        если у пользователя нет доступа к разделу «Чат со S.C.O.P.E.»
-        (см. _can_access_item). Так голодиск не превращается в обходной
-        путь к данным, закрытым в обычном меню."""
         rows = []
 
         rows.append({"text": "Журнал/", "selectable": False, "abs": None, "rel": None})
@@ -2115,8 +2069,6 @@ lib_vault_network.so (v1.4.0)
         return False
 
     def _launch_hack_module(self):
-        """Запуск мини-игры взлома пароля."""
-
         # Генерируем случайный пароль из WORD_BANK
         self.hack_correct_password = random.choice(WORD_BANK)
         
@@ -2136,7 +2088,6 @@ lib_vault_network.so (v1.4.0)
         self._render_hack_screen()
 
     def _generate_hack_display(self, passwords):
-        """Генерирует отображение терминала для мини-игры взлома."""
         display = []
         display.append("")
         display.append("ВВЕДИТЕ ПАРОЛЬ")
@@ -2216,12 +2167,10 @@ lib_vault_network.so (v1.4.0)
         return display, active_bonus_inputs, all_content
 
     def _generate_random_chars(self, length):
-        """Генерирует случайные спецсимволы."""
         special_chars = "+#*$&)(=!?<>-_.,;:/"
         return ''.join(random.choice(special_chars) for _ in range(length))
 
     def _generate_new_bonus_string(self):
-        """Генерирует новую случайную строку для замены бонусного кода."""
         special_chars = "+#*$&)(=!?<>-_.,;:/"
         while True:
             s = ''.join(random.choice(special_chars) for _ in range(12))
@@ -2229,7 +2178,6 @@ lib_vault_network.so (v1.4.0)
                 return s
 
     def _render_hack_screen(self):
-        """Отображает экран мини-игры взлома."""
         self.state = self.STATE_HACK_MINIGAME
         
         # Строим строки для вывода
@@ -2493,8 +2441,6 @@ lib_vault_network.so (v1.4.0)
         self.output.push(text)
 
     def _log_list_back(self):
-        """Куда вернуться из списка записей журнала: owner — к выбору
-        пользователя, остальные уровни доступа — сразу в главное меню."""
         if self.current_user_level == "owner":
             self._enter_log_user_list()
         else:
@@ -2589,7 +2535,6 @@ lib_vault_network.so (v1.4.0)
         self.output.push(text)
 
     def _enter_system_view(self, category):
-        """Просмотр системного файла."""
         self.state = self.STATE_SYSTEM_VIEW
         self.fixed_header = True
         self.output.clear()
@@ -2610,7 +2555,6 @@ lib_vault_network.so (v1.4.0)
             self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
 
     def _enter_system_profiles(self):
-        """Вход в список профилей пользователей."""
         self.state = self.STATE_SYSTEM_PROFILES
         self.fixed_header = True
         self.output.clear()
@@ -2644,7 +2588,6 @@ lib_vault_network.so (v1.4.0)
         self.output.push(text)
 
     def _view_system_profile(self, filename):
-        """Просмотр профиля пользователя."""
         self.state = self.STATE_SYSTEM_PROFILE_VIEW
         self.fixed_header = True
         self.output.clear()
@@ -2661,7 +2604,6 @@ lib_vault_network.so (v1.4.0)
             self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
 
     def _enter_system_actions(self):
-        """Вход в список логов действий."""
         self.state = self.STATE_SYSTEM_ACTIONS
         self.fixed_header = True
         self.output.clear()
@@ -2686,7 +2628,6 @@ lib_vault_network.so (v1.4.0)
         self.output.push(text)
 
     def _view_system_action(self, filename):
-        """Просмотр лога действий."""
         self.state = self.STATE_SYSTEM_ACTION_VIEW
         self.fixed_header = True
         self.output.clear()
@@ -2701,7 +2642,7 @@ lib_vault_network.so (v1.4.0)
         except FileNotFoundError:
             self.output.push("\nФайл не найден.\n[Нажмите Enter, чтобы вернуться...]")
 
-    # -------------------------------------------------------------- чат-ИИ
+    # Чат-ИИ
     MQTT_CONNECT_GRACE_SECONDS = 3.0
 
     def _enter_chat_menu(self):
@@ -2798,8 +2739,6 @@ lib_vault_network.so (v1.4.0)
         self._mqtt_connect()
 
     def _mqtt_connect(self):
-        """Неблокирующее подключение: connect_async() не ждёт ответа сети,
-        реальная попытка соединения идёт в фоновом потоке loop_start()."""
         if not MQTT_LIB_AVAILABLE or self.mqtt_client is not None:
             return
         try:
@@ -2831,9 +2770,6 @@ lib_vault_network.so (v1.4.0)
             self._chat_status_resolved = True
 
     def _poll_chat_status(self):
-        """Вызывается каждый кадр, пока мы в чате и статус ещё не объявлен
-        пользователю — ждём либо успешного connect, либо истечения таймаута
-        на попытку, и только тогда один раз печатаем итог."""
         if self.state != self.STATE_CHAT or self._chat_status_resolved:
             return
         if self.mqtt_connected:
@@ -3122,6 +3058,11 @@ lib_vault_network.so (v1.4.0)
         if self.state == self.STATE_CHAT_SAVED:
             self._enter_chat_menu()
             return
+        
+        if self.state == self.STATE_MAP:
+            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
+            self._handle_map_input(text)
+            return
 
     def _handle_main_menu(self, text):
         if text == "0":
@@ -3156,7 +3097,7 @@ lib_vault_network.so (v1.4.0)
             return
         self.new_log_lines.append(text)
 
-    # ------------------------------------------------------------- события
+    # Cобытия
     def handle_event(self, event):
         if event.type == pygame.QUIT:
             self.running = False
@@ -3182,10 +3123,6 @@ lib_vault_network.so (v1.4.0)
                     self._disk_reader_copy_selected()
                 return
             if self.state == self.STATE_MAP:
-                # Esc всегда отменяет ТЕКУЩИЙ под-режим карты, а не сразу
-                # закрывает раздел — иначе случайно нажатый Esc во время
-                # наведения прицела или ввода названия выкидывал бы в
-                # главное меню, теряя начатое действие.
                 if event.key == pygame.K_ESCAPE:
                     self._play("clack")
                     if self.map_state == "VIEW":
@@ -3199,10 +3136,7 @@ lib_vault_network.so (v1.4.0)
                     return
 
                 if self.map_state == "VIEW":
-                    # Обычный просмотр: стрелки двигают камеру, +/- — зум,
-                    # M/R запускают наведение прицела (единая логика для
-                    # отметки и маршрута — см. ниже), подтверждение в обоих
-                    # случаях — Enter.
+                    # Обычный просмотр
                     if event.key == pygame.K_UP:
                         self.map_view_lat += self.map_zoom * 0.1
                         self._clamp_map_view()
@@ -3225,15 +3159,35 @@ lib_vault_network.so (v1.4.0)
                         self.map_cursor_lon = self.map_view_lon
                         self._play("clack")
                     elif event.key == pygame.K_r:
-                        self.map_state = "CURSOR_ROUTE"
-                        self.map_cursor_lat = self.map_view_lat
-                        self.map_cursor_lon = self.map_view_lon
+                        if not self.map_markers.markers:
+                            self.map_state = "CURSOR_ROUTE"
+                            self.map_cursor_lat = self.map_view_lat
+                            self.map_cursor_lon = self.map_view_lon
+                            self._play("clack")
+                        else:
+                            self.map_state = "ROUTE_SELECT_MODE"
+                            self.map_route_state = "SELECT_MODE"
+                            self._play("clack")
+                    return
+                
+                if self.map_state == "ROUTE_SELECT_MODE":
+                    # Обрабатываем только цифровые клавиши для выбора
+                    if event.key in (pygame.K_0, pygame.K_1, pygame.K_2):
                         self._play("clack")
+                        # Отправляем ввод через handle_submit
+                        self.input_text = chr(event.key)
+                        submitted = self.input_text
+                        self.input_text = ""
+                        self.handle_submit(submitted)
+                    elif event.key == pygame.K_ESCAPE:
+                        self._play("clack")
+                        self.map_state = "VIEW"
+                        self.map_route_state = None
+                        self.output.push("Построение маршрута отменено.\n", instant=True)
                     return
 
                 if self.map_state in ("CURSOR_MARKER", "CURSOR_ROUTE"):
-                    # Наведение прицела: стрелки двигают саму точку выбора
-                    # (не камеру), Enter фиксирует её.
+                    # Наведение прицела
                     step = self.map_zoom * MAP_CURSOR_STEP_FACTOR
                     if event.key == pygame.K_UP:
                         self.map_cursor_lat += step
@@ -3247,27 +3201,26 @@ lib_vault_network.so (v1.4.0)
                     elif event.key == pygame.K_RIGHT:
                         self.map_cursor_lon += step
                         self._clamp_map_cursor()
+                    elif event.key == pygame.K_EQUALS or event.key == pygame.K_PLUS:
+                        self.map_zoom = max(0.001, self.map_zoom * 0.9)
+                        self._clamp_map_cursor()
+                    elif event.key == pygame.K_MINUS:
+                        self.map_zoom = min(0.5, self.map_zoom * 1.1)
+                        self._clamp_map_cursor()
                     elif event.key == pygame.K_RETURN:
                         if self.map_state == "CURSOR_MARKER":
-                            # Для отметки координаты фиксируем сразу, а сам
-                            # текст запрашиваем следующим шагом.
                             self.map_pending_marker_latlon = (self.map_cursor_lat, self.map_cursor_lon)
                             self.map_state = "ADD_MARKER_TEXT"
                             self.map_marker_input = ""
                             self._play("clack")
                         else:
-                            # Для маршрута название не нужно — точка не
-                            # сохраняется на диск как обычная отметка,
-                            # это временный ориентир для линии маршрута.
                             target_lat, target_lon = self.map_cursor_lat, self.map_cursor_lon
                             self.map_route_target = MapMarker(target_lat, target_lon, "Точка маршрута")
-                            # Пеший маршрут по графу дорог/тропинок от
-                            # текущей позиции терминала до выбранной точки.
                             self.map_route_path = self._find_road_path(
                                 TERMINAL_LAT, TERMINAL_LON, target_lat, target_lon
                             )
                             if self.map_route_path:
-                                self.output.push("\nМаршрут проложен по дорогам до выбранной точки.\n", instant=True)
+                                self.output.push("\nМаршрут построен.\n", instant=True)
                             else:
                                 self.output.push(
                                     "\nПуть по дорогам не найден — маршрут показан по прямой.\n", instant=True
@@ -3333,9 +3286,6 @@ lib_vault_network.so (v1.4.0)
                 self.input_text += event.unicode
 
     def _format_menu_lines(self, items):
-        """items — список (номер_как_строка, подпись). Пункт '0' обычно
-        передаётся последним. Закрывающие скобки выравниваются пробелами
-        по самому длинному пункту в этом конкретном меню."""
         max_w = max(len(f"{num}. {label}") for num, label in items)
         return "\n".join(f"[{f'{num}. {label}'.ljust(max_w)}]" for num, label in items)
 
@@ -3343,8 +3293,6 @@ lib_vault_network.so (v1.4.0)
         return self.max_visible_lines_header if self.fixed_header else self.max_visible_lines_full
 
     def _schedule(self, delay_seconds, callback):
-        """Выполнить callback() через delay_seconds. Пока действие не сработало,
-        предыдущее состояние (текст на экране) остаётся видимым как есть."""
         self._pending_callback = callback
         self._pending_callback_at = time.time() + delay_seconds
 
@@ -3374,7 +3322,7 @@ lib_vault_network.so (v1.4.0)
                     cx += part_surf.get_width()
         return cx
 
-    # --------------------------------------------------------------- кадр
+    # Кадр
     def update(self, dt):
         if self.state == self.STATE_SPLASH:
             self._update_splash()
@@ -3401,8 +3349,6 @@ lib_vault_network.so (v1.4.0)
             callback()
 
     def _update_scroll_repeat(self):
-        """Повтор прокрутки при удержании стрелок — реализован вручную,
-        не через глобальный pygame.key.set_repeat(), чтобы не задевать Enter."""
         keys = pygame.key.get_pressed()
         held_up = keys[pygame.K_UP]
         held_down = keys[pygame.K_DOWN]
