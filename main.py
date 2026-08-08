@@ -13,11 +13,6 @@ Vault-Tec / RobCo Terminal — Pygame edition with CRT bloom/scanline effects.
     pip install pyinstaller
     pyinstaller --onefile --windowed --add-data "FalloutDocuments:FalloutDocuments" --add-data "media:media" main.py
 
-Управление:
-    Цифры + Enter — выбор пункта меню (как в оригинальном RobCo-терминале)
-    Стрелки вверх/вниз — прокрутка текста, если он не помещается на экран
-    Esc  — назад / отмена ввода
-    В чате с мастером: просто печатаете текст и жмёте Enter, "exit" — выход из чата
 """
 
 import os
@@ -423,15 +418,8 @@ class SystemLogger:
         return f"{dt.day:02d} {month} {dt.year} {dt.hour:02d}:{dt.minute:02d}:{dt.second:02d}"
     
     def log(self, speaker, message, is_system=False, is_user_input=False, instant=False):
-        """Записывает событие в лог.
-        
-        Args:
-            speaker: Имя говорящего (пользователь или "SYSTEM")
-            message: Сообщение
-            is_system: Если True, speaker заменяется на "SYSTEM"
-            is_user_input: Если True, это ввод пользователя
-            instant: Если True, пишем в файл немедленно
-        """
+        """Записывает событие в лог."""
+
         if not self.log_path or not os.path.exists(self.log_path):
             return
         
@@ -497,12 +485,6 @@ class MapMarker:
             with open(filepath, "r", encoding="utf-8") as f:
                 content = f.read()
             
-            # Парсим формат:
-            # ---
-            # lat: 55.7522
-            # lon: 37.6156
-            # ---
-            # Текст отметки
             lines = content.strip().split("\n")
             lat = None
             lon = None
@@ -771,9 +753,6 @@ class TerminalApp:
         # Системный логгер
         self.system_logger = SystemLogger(SYSTEM_DIR)
 
-        # Создаём системную папку и её структуру
-        self._initialize_system_folder()
-
         # Карта
         self.map_image = None
         self.map_bounds = None
@@ -881,175 +860,6 @@ class TerminalApp:
         if self.state != self.STATE_SPLASH:
             return
         self._leave_splash()
-
-    def _initialize_system_folder(self):
-        if not ENABLE_SYSTEM:
-            return
-    
-        # Создаём основную папку
-        os.makedirs(SYSTEM_DIR, exist_ok=True)
-    
-        # Создаём файл "Сведения о системе.md"
-        system_info_path = os.path.join(SYSTEM_DIR, "Сведения о системе.md")
-        if not os.path.exists(system_info_path):
-            with open(system_info_path, "w", encoding="utf-8") as f:
-                f.write("""# СВЕДЕНИЯ О СИСТЕМЕ
-
-## Терминальная система ROBCO Industries (TM)
-
-**Версия ОС:** ROBCO OS v2.3.1 (2077)
-**Кодовое имя:** "Vault-Tec Secure"
-**Архитектура:** RobCo TERMLINK v4
-
----
-
-### Аппаратное обеспечение
-
-**Процессор:** RobCo R-32 (32-бит, 16 МГц)
-**Память:** 64 КБ ОЗУ (расширяемая до 256 КБ)
-**Хранилище:** Голографический накопитель (1 ТБ)
-**Дисплей:** Монохромный TFT, 960x600
-
----
-
-### Системные модули
-
-| Модуль                 | Статус  | Версия |
-|------------------------|---------|--------|
-| Ядро ОС                | АКТИВЕН | 2.3.1  |
-| Сеть терминалов        | АКТИВНА | 1.4.0  |
-| Протоколы безопасности | АКТИВНЫ | 3.0.0  |
-| Интерфейс голодисков   | АКТИВЕН | 2.1.0  |
-
----
-
-### Служебная информация
-Хэш-сумма ядра: 0x7F3A9B1C
-Контрольная сумма: 0xDEADBEEF
-Время работы: непрерывно с 2075 года
-""")
-    
-        # Создаём папку actions
-        actions_dir = os.path.join(SYSTEM_DIR, "actions")
-        os.makedirs(actions_dir, exist_ok=True)
-    
-        # Создаём папку profiles
-        profiles_dir = os.path.join(SYSTEM_DIR, "profiles")
-        os.makedirs(profiles_dir, exist_ok=True)
-    
-        # Создаём профили пользователей
-        for account in USER_ACCOUNTS:
-            profile_path = os.path.join(profiles_dir, f"{account['id']}.md")
-            if not os.path.exists(profile_path):
-                with open(profile_path, "w", encoding="utf-8") as f:
-                    f.write(f"""# ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ
-
-## {account['name']}
-
-**ID:** {account['id']}
-**Уровень доступа:** {account['level']}
-**Статус:** АКТИВЕН
-
----
-
-### Права доступа
-
-{f'''
-- Полный доступ ко всем системам
-- Управление пользователями
-- Доступ к логам всех пользователей
-''' if account['level'] == 'owner' else f'''
-- Стандартный доступ к системе
-- Доступ к собственному журналу
-- Чтение голодисков
-''' if account['level'] == 'user' else f'''
-- Административный доступ
-- Управление дверьми
-- Доступ к системным файлам
-'''}
-
----
-
-### Хэш-ключ
-{''.join(random.choices('0123456789ABCDEF', k=32))}
-
-""")
-    
-        # Создаём системные файлы для каждого компонента
-        components = []
-        if ENABLE_DOOR_CONTROL:
-            components.append(("door_control", "Управление дверьми"))
-        if ENABLE_CHAT:
-            components.append(("chat", "Чат со S.C.O.P.E."))
-        if ENABLE_DISK_READER:
-            components.append(("disk_reader", "Чтение голодисков"))
-        if ENABLE_SYSTEM:
-            components.append(("system", "Система"))
-    
-        for comp_id, comp_name in components:
-            comp_dir = os.path.join(SYSTEM_DIR, comp_id)
-            os.makedirs(comp_dir, exist_ok=True)
-        
-            # Создаём файл конфигурации компонента
-            config_path = os.path.join(comp_dir, "config.md")
-            if not os.path.exists(config_path):
-                with open(config_path, "w", encoding="utf-8") as f:
-                    f.write(f"""# СИСТЕМНЫЙ ФАЙЛ КОМПОНЕНТА
-
-## {comp_name}
-
-**Идентификатор:** {comp_id}
-**Версия:** 1.0.{random.randint(0, 9)}
-**Статус:** ЗАГРУЖЕН
-
----
-
-### Параметры
-
-```ini
-[component]
-id = {comp_id}
-name = {comp_name}
-enabled = true
-version = 1.0.{random.randint(0, 9)}
-priority = {random.randint(1, 10)}
-```
-
-### Библиотеки зависимостей
-
-lib_{comp_id}.so (v{random.randint(1, 3)}.{random.randint(0, 9)})
-lib_robco_core.so (v2.3.1)
-lib_vault_network.so (v1.4.0)
-
-### Журнал загрузки
-
-[SYSTEM] Загрузка компонента {comp_id}...
-[SYSTEM] Проверка целостности...
-[SYSTEM] OK
-[SYSTEM] Загрузка зависимостей...
-[SYSTEM] OK
-[SYSTEM] Компонент {comp_name} загружен.
-
-""")
-
-        #Удаляем лишние папки компонентов
-        existing_comps = set()
-        for item in os.listdir(SYSTEM_DIR):
-            item_path = os.path.join(SYSTEM_DIR, item)
-            if os.path.isdir(item_path):
-                existing_comps.add(item)
-        
-        #Удаляем лишние папки (кроме actions, profiles и известных компонентов)
-        known_folders = {"actions", "profiles"}
-        for comp_id, _ in components:
-            known_folders.add(comp_id)
-
-        for folder in existing_comps:
-            if folder not in known_folders:
-                try:
-                    shutil.rmtree(os.path.join(SYSTEM_DIR, folder))
-                except OSError:
-                    pass
 
     def _load_map_image(self):
         map_path = os.path.join("images", "map.png")
