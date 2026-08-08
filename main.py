@@ -647,24 +647,24 @@ class TerminalApp:
 
         self.font = pygame.font.SysFont("couriernew,consolas,menlo,monospace", FONT_SIZE)
         line_h = self.font.get_linesize() + LINE_SPACING
-        SCROLL_INDICATOR_ROWS = 2  # "ещё текст выше" + "ещё текст ниже" — резервируем всегда
 
         # Без закреплённой шапки (BOOT/PASSWORD) — вся высота под прокрутку.
         self.max_visible_lines_full = max(
-            1, (RENDER_H - MARGIN * 2 - line_h - SCROLL_INDICATOR_ROWS * line_h) // line_h
+            1, (RENDER_H - MARGIN * 2) // line_h
         )
 
         # С закреплённой шапкой — сверху вычитаем место под неё + отступ.
         header_reserved = (HEADER_LINE_COUNT + HEADER_GAP_LINES) * line_h
         self.max_visible_lines_header = max(
             1,
-            (RENDER_H - MARGIN * 2 - line_h - header_reserved - SCROLL_INDICATOR_ROWS * line_h) // line_h,
+            (RENDER_H - MARGIN * 2 - line_h - header_reserved) // line_h,
         )
 
         self.output = OutputBuffer(self.max_visible_lines_full)
         self.input_text = ""
         self.cursor_visible = True
         self.cursor_timer = 0.0
+        self.command_history = []
 
         # Ручной повтор для удержания стрелок вверх/вниз (см. update())
         self._scroll_hold_start = None
@@ -673,6 +673,7 @@ class TerminalApp:
         SCROLL_REPEAT_INTERVAL = 0.04  # интервал между повторами (сек)
         self._scroll_repeat_delay = SCROLL_REPEAT_DELAY
         self._scroll_repeat_interval = SCROLL_REPEAT_INTERVAL
+        self.command_history_scroll = 0
 
         self.scanlines = make_scanlines(RENDER_W, RENDER_H)
         self.vignette = make_vignette(RENDER_W, RENDER_H)
@@ -703,7 +704,6 @@ class TerminalApp:
         self.hack_bonus_codes = []
         self.hack_all_content = []
         self.hack_attempts = 0
-        self.hack_guess_history = []
         self.hack_state = "INACTIVE"  # INACTIVE, ACTIVE, SUCCESS, FAILED
         self.hack_initial_render = True
         self.hack_restore_smiley = ""  # Какой смайл восстанавливает попытку
@@ -806,6 +806,7 @@ class TerminalApp:
         self._load_map_image()
         self._load_map_bounds()
         self._load_road_graph()
+
 
     # Звук
     def _play(self, name):
@@ -1511,6 +1512,307 @@ lib_vault_network.so (v1.4.0)
             wrapped_input = self._wrap_line_for_sidebar(input_line, max_chars)
             self.render_ansi_text(surf, wrapped_input[-1], inner_x, input_y + line_h)
 
+    def _render_two_column(self, surf):
+        """Рендерит двухколоночную вёрстку: левая колонка (2/3) - контент, правая (1/3) - интерфейс"""
+        surf.fill(COLOR_BG)
+        
+        # Вычисляем отступ для контента с учётом шапки
+        header_height = 0
+        if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
+            line_h = self.font.get_linesize() + LINE_SPACING
+            header_height = (len(HEADER_BANNER.split("\n")) + 2) * line_h + line_h * HEADER_GAP_LINES
+        
+        # Левая колонка - основной контент (с отступом сверху)
+        left_surf = pygame.Surface((self.map_viewport_w, RENDER_H - MARGIN * 2 - header_height))
+        left_surf.fill(COLOR_BG)
+        self._render_text_content(left_surf, self.map_viewport_x, self.map_viewport_y + header_height)
+        
+        # Правая колонка - системный журнал (с отступом сверху)
+        right_surf = pygame.Surface((MAP_SIDEBAR_WIDTH, RENDER_H - MARGIN * 2 - header_height))
+        right_surf.fill((0, 0, 0, 150))
+        self._render_sidebar_content(right_surf, self.map_sidebar_x, self.map_sidebar_y + header_height)
+        
+        # Блендим колонки на основную поверхность
+        surf.blit(left_surf, (self.map_viewport_x, self.map_viewport_y + header_height))
+        surf.blit(right_surf, (self.map_sidebar_x, self.map_sidebar_y + header_height))
+        
+        # ШАПКА ПОВЕРХ ВСЕГО (на всю ширину)
+        if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
+            self._render_full_width_header(surf)
+        
+        # Эффекты
+        bloom = make_bloom(surf)
+        surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        surf.blit(self.scanlines, (0, 0))
+        surf.blit(self.vignette, (0, 0))
+
+    def _render_full_width_header(self, surf):
+        """Рендерит шапку на всю ширину экрана"""
+        line_h = self.font.get_linesize() + LINE_SPACING
+        y = MARGIN
+        
+        # Логотип
+        for header_line in HEADER_BANNER.split("\n"):
+            header_surf = self.font.render(header_line, True, COLOR_TEXT)
+            surf.blit(header_surf, (MARGIN, y))
+            y += line_h
+        
+        # Дата и пользователь
+        date_str = self._current_datetime_str()
+        user_str = f"Пользователь: {self.current_user}"
+        date_surf = self.font.render(date_str, True, COLOR_TEXT)
+        user_surf = self.font.render(user_str, True, COLOR_TEXT)
+        surf.blit(date_surf, (MARGIN, y))
+        surf.blit(user_surf, (RENDER_W - MARGIN - user_surf.get_width(), y))
+        y += line_h
+        
+        # Разделитель
+        y += line_h * HEADER_GAP_LINES
+
+    def _render_text_content(self, surf, x, y):
+        """Рендерит текстовое содержимое терминала в левой колонке"""
+        line_h = self.font.get_linesize() + LINE_SPACING
+        n = self._current_max_lines()
+        
+        # Показываем строки без отступов и индикаторов
+        visible = self.output.visible_lines(n)
+        y_pos = 0
+        for line in visible:
+            self.render_ansi_text(surf, line, 0, y_pos)
+            y_pos += line_h
+
+    def _render_sidebar_content(self, surf, x, y):
+        """Рендерит правую колонку - история команд и поле ввода"""
+        line_h = self.font.get_linesize() + LINE_SPACING
+        pad = 10
+        inner_x = pad
+        
+        surf_height = surf.get_height()
+        surf_width = surf.get_width()
+        
+        # Вычисляем максимальное количество символов в строке
+        avg_char_width = self.font.size("A")[0]
+        max_chars = max(1, (surf_width - pad * 2) // avg_char_width - 2)
+        
+        # --- ИСТОРИЯ КОМАНД (с прокруткой) ---
+        # Преобразуем всё в строки (защита от кортежей)
+        command_history = []
+        for item in self.command_history:
+            if isinstance(item, tuple):
+                command_history.append(" ".join(str(x) for x in item))
+            else:
+                command_history.append(str(item))
+        
+        if not command_history:
+            command_history = ["[СИСТЕМА] Введите команду..."]
+        
+        # Максимальное количество строк, помещающихся в правой колонке
+        max_history_lines = (surf_height - pad - line_h * 3) // line_h
+        if max_history_lines < 1:
+            max_history_lines = 1
+        
+        # Применяем прокрутку
+        total_lines = len(command_history)
+        max_scroll = max(0, total_lines - max_history_lines)
+        
+        # Ограничиваем смещение
+        self.command_history_scroll = min(self.command_history_scroll, max_scroll)
+        self.command_history_scroll = max(0, self.command_history_scroll)
+        
+        # Вычисляем диапазон видимых строк
+        start_idx = max(0, total_lines - max_history_lines - self.command_history_scroll)
+        end_idx = start_idx + max_history_lines
+        history_lines = command_history[start_idx:end_idx]
+        
+        # Если есть место, заполняем сверху пустыми строками (для скролла вниз)
+        if self.command_history_scroll > 0 and len(history_lines) < max_history_lines:
+            empty_lines = max_history_lines - len(history_lines)
+            history_lines = [""] * empty_lines + history_lines
+        
+        # Рендерим историю с переносом
+        current_y = pad
+        for history_line in history_lines:
+            if history_line:  # Не рисуем пустые строки
+                wrapped = self._wrap_line_for_sidebar(history_line, max_chars)
+                for wrapped_line in wrapped:
+                    self.render_ansi_text(surf, wrapped_line, inner_x, current_y)
+                    current_y += line_h
+                    if current_y > surf_height - pad - line_h * 2:
+                        break
+            else:
+                current_y += line_h
+            if current_y > surf_height - pad - line_h * 2:
+                break
+        
+        # --- ПОЛЕ ВВОДА ---
+        current_y = surf_height - pad - line_h
+        pygame.draw.line(surf, COLOR_DIM, (inner_x, current_y - line_h // 2), 
+                        (surf_width - pad, current_y - line_h // 2), 1)
+        
+        cursor = "_" if self.cursor_visible else " "
+        
+        # Маскируем пароль звёздами
+        if self.state == self.STATE_PASSWORD:
+            display_text = "*" * len(self.input_text)
+        else:
+            display_text = self.input_text
+        
+        input_prompt = "> " + display_text + cursor
+        input_surf = self.font.render(input_prompt, True, COLOR_TEXT)
+        surf.blit(input_surf, (inner_x, current_y))
+        
+        # --- ИНДИКАТОРЫ ПРОКРУТКИ ---
+        if total_lines > max_history_lines:
+            # Стрелка вверх, если есть старые команды
+            if self.command_history_scroll < max_scroll:
+                indicator = self.font.render("▲", True, COLOR_DIM)
+                surf.blit(indicator, (surf_width - pad - indicator.get_width(), pad))
+                
+                # Подсказка
+                hint = self.font.render("[↑] вверх", True, COLOR_DIM)
+                surf.blit(hint, (surf_width - pad - hint.get_width(), pad + line_h))
+            
+            # Стрелка вниз, если есть свежие команды
+            if self.command_history_scroll > 0:
+                indicator = self.font.render("▼", True, COLOR_DIM)
+                y_pos = surf_height - pad - line_h * 2 - indicator.get_height()
+                surf.blit(indicator, (surf_width - pad - indicator.get_width(), y_pos))
+                
+                # Подсказка
+                hint = self.font.render("[↓] вниз", True, COLOR_DIM)
+                hint_y = y_pos - line_h
+                surf.blit(hint, (surf_width - pad - hint.get_width(), hint_y))
+
+    def _wrap_text_by_width(self, text, max_width):
+        """Разбивает текст на строки по ширине в пикселях"""
+        if not text:
+            return [""]
+        
+        # Если текст помещается в одну строку
+        if self.font.size(text)[0] <= max_width:
+            return [text]
+        
+        # Разбиваем по словам
+        words = text.split(' ')
+        lines = []
+        current_line = []
+        current_width = 0
+        
+        for word in words:
+            word_width = self.font.size(word)[0]
+            # Если слово шире max_width, разбиваем его посимвольно
+            if word_width > max_width:
+                # Если есть текущая строка - сохраняем её
+                if current_line:
+                    lines.append(' '.join(current_line))
+                    current_line = []
+                    current_width = 0
+                # Разбиваем длинное слово посимвольно
+                chars = list(word)
+                temp_line = []
+                temp_width = 0
+                for ch in chars:
+                    ch_width = self.font.size(ch)[0]
+                    if temp_width + ch_width <= max_width:
+                        temp_line.append(ch)
+                        temp_width += ch_width
+                    else:
+                        if temp_line:
+                            lines.append(''.join(temp_line))
+                        temp_line = [ch]
+                        temp_width = ch_width
+                if temp_line:
+                    lines.append(''.join(temp_line))
+                continue
+            
+            # Проверяем, поместится ли слово в текущую строку
+            space_width = self.font.size(' ')[0] if current_line else 0
+            if current_width + word_width + (space_width if current_line else 0) <= max_width:
+                current_line.append(word)
+                current_width += word_width + (space_width if len(current_line) > 1 else 0)
+            else:
+                # Сохраняем текущую строку и начинаем новую
+                if current_line:
+                    lines.append(' '.join(current_line))
+                current_line = [word]
+                current_width = word_width
+        
+        # Добавляем последнюю строку
+        if current_line:
+            lines.append(' '.join(current_line))
+        
+        # Если всё ещё есть строки длиннее max_width (страховка)
+        result = []
+        for line in lines:
+            if self.font.size(line)[0] <= max_width:
+                result.append(line)
+            else:
+                # Разбиваем посимвольно как fallback
+                chars = list(line)
+                temp = []
+                temp_width = 0
+                for ch in chars:
+                    ch_width = self.font.size(ch)[0]
+                    if temp_width + ch_width <= max_width:
+                        temp.append(ch)
+                        temp_width += ch_width
+                    else:
+                        if temp:
+                            result.append(''.join(temp))
+                        temp = [ch]
+                        temp_width = ch_width
+                if temp:
+                    result.append(''.join(temp))
+        
+        return result
+
+    def _render_chat_fullscreen(self, surf):
+        """Рендерит чат на весь экран (без двухколоночной вёрстки)"""
+        y = MARGIN
+        line_h = self.font.get_linesize() + LINE_SPACING
+        n = self._current_max_lines()
+        
+        if self.fixed_header:
+            for header_line in HEADER_BANNER.split("\n"):
+                header_surf = self.font.render(header_line, True, COLOR_TEXT)
+                surf.blit(header_surf, (MARGIN, y))
+                y += line_h
+            
+            date_str = self._current_datetime_str()
+            user_str = f"Пользователь: {self.current_user}"
+            date_surf = self.font.render(date_str, True, COLOR_TEXT)
+            user_surf = self.font.render(user_str, True, COLOR_TEXT)
+            surf.blit(date_surf, (MARGIN, y))
+            surf.blit(user_surf, (RENDER_W - MARGIN - user_surf.get_width(), y))
+            y += line_h
+            y += line_h * HEADER_GAP_LINES
+        
+        content_top_y = y
+        if self.output.has_more_above(n):
+            indicator = self.font.render("^ Листать вверх ^", True, COLOR_DIM)
+            surf.blit(indicator, (MARGIN, content_top_y))
+        y += line_h
+        
+        visible = self.output.visible_lines(n)
+        for line in visible:
+            self.render_ansi_text(surf, line, MARGIN, y)
+            y += line_h
+        
+        if self.output.has_more_below():
+            indicator = self.font.render("v Листать вниз v", True, COLOR_DIM)
+            surf.blit(indicator, (MARGIN, y))
+        y += line_h
+        
+        if not self.output.is_typing() and self.state not in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
+            prompt = "> " + self.input_text + ("_" if self.cursor_visible else " ")
+            prompt_surf = self.font.render(prompt, True, COLOR_TEXT)
+            surf.blit(prompt_surf, (MARGIN, y))
+        
+        bloom = make_bloom(surf)
+        surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+        surf.blit(self.scanlines, (0, 0))
+        surf.blit(self.vignette, (0, 0))
+
     def _draw_dashed_line(self, surf, start, end, color, dash_length=10, gap_length=10, width=2):
         """Рисует пунктирную линию"""
         dx = end[0] - start[0]
@@ -1540,7 +1842,7 @@ lib_vault_network.so (v1.4.0)
         pygame.draw.polygon(surf, (255, 50, 50), points)
         pygame.draw.polygon(surf, (255, 160, 160), points, 3)
 
-    # ---------------------------------------------------------------- boot
+    # Загрузка
     def _boot(self):
         self.fixed_header = True
         self.output.push(
@@ -1604,11 +1906,12 @@ lib_vault_network.so (v1.4.0)
         self.fixed_header = True
         attempts_left = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
         user_name = self.pending_user["name"] if self.pending_user else ""
+        self.output.clear()
         if extra_message:
             text = f"{extra_message}\n"
         else:
             text = f"ПОЛЬЗОВАТЕЛЬ: {user_name}\nВВЕДИТЕ ПАРОЛЬ\n"
-        text += f"ПОПЫТОК ОСТАЛОСЬ: " + "■ " * attempts_left + "\nВведите пароль:\n"
+        text += f"ОСТАЛОСЬ ПОПЫТОК: " + "■ " * attempts_left
         self.output.push(text)
         self.system_logger.start_session(self.current_user, self.current_user_id)
 
@@ -2080,7 +2383,6 @@ lib_vault_network.so (v1.4.0)
         # Генерируем отображение терминала
         self.hack_display, self.hack_bonus_codes, self.hack_all_content = self._generate_hack_display(display_passwords)
         self.hack_attempts = MAX_PASSWORD_ATTEMPTS - self.password_attempts_used
-        self.hack_guess_history = []
         self.hack_state = "ACTIVE"
         self.fixed_header = False
         self.hack_initial_render = True  # Флаг для первого рендера
@@ -2089,7 +2391,6 @@ lib_vault_network.so (v1.4.0)
 
     def _generate_hack_display(self, passwords):
         display = []
-        display.append("")
         display.append("ВВЕДИТЕ ПАРОЛЬ")
         display.append("")
         
@@ -2140,11 +2441,11 @@ lib_vault_network.so (v1.4.0)
                 if smiley in selected_smileys:
                     active_bonus_inputs.append(smiley)
         
-        # Заполняем до 32 записей случайными строками
+        # Заполняем до 24 записей (12 строк * 2 колонки)
         def is_valid_random_string(s):
             return all(s[i] != s[i+1] or s[i] != s[i+2] for i in range(len(s) - 2))
         
-        while len(all_content) < 32:
+        while len(all_content) < 24:  # <-- ИЗМЕНЕНО: 24 вместо 32
             s = self._generate_random_chars(12)
             while not is_valid_random_string(s):
                 s = self._generate_random_chars(12)
@@ -2152,9 +2453,9 @@ lib_vault_network.so (v1.4.0)
         
         random.shuffle(all_content)
         
-        # Формируем строки отображения
+        # Формируем строки отображения (12 строк вместо 16)
         content_index = 0
-        for line in range(16):
+        for line in range(12):  # <-- ИЗМЕНЕНО: 12 вместо 16
             addr1 = f"0x{0xF4F0 + line * 20:04X}"
             addr2 = f"0x{0xF4F0 + line * 20 + 14:04X}"
             content1 = all_content[content_index][1][:12]
@@ -2192,25 +2493,12 @@ lib_vault_network.so (v1.4.0)
         lines_to_push.insert(2, attempts_line)
         lines_to_push.insert(3, "")
         
-        # Добавляем историю попыток в конец
-        for guess, match in self.hack_guess_history[-8:]:
-            lines_to_push.append("")
-            lines_to_push.append("")
-            lines_to_push.append(" " * 43 + f">{guess}")
-            if match != "":  # Для бонусов match содержит сообщение
-                lines_to_push.append(" " * 43 + f">{match}")
-            else:
-                lines_to_push.append(" " * 43 + f">Неверно")
-        
-        # Добавляем подсказку по управлению
-        lines_to_push.append("")
-        lines_to_push.append("Введите пароль:")
-        
         # Очищаем и выводим
         self.output.clear()
-        # При первом рендере используем instant=False, иначе instant=True
         self.output.push("\n".join(lines_to_push), instant=not self.hack_initial_render)
         self.hack_initial_render = False
+
+        self.output.scroll_offset = 0
 
     def _try_hack_guess(self, text):
         """Проверяет введённое слово/код."""
@@ -2227,7 +2515,7 @@ lib_vault_network.so (v1.4.0)
                 if self.hack_attempts < 4:
                     self.hack_attempts += 1
                 self._play("complete")
-                self.hack_guess_history.append((f"[БОНУС] {text}", "Попытка восстановлена"))
+                self.command_history.append(("[БОНУС] Попытка восстановлена"))
                 # После использования смайла восстановления, больше не будет восстановлений
                 self.hack_restore_smiley = ""
             else:
@@ -2256,9 +2544,9 @@ lib_vault_network.so (v1.4.0)
                                     word_replaced = True
                                     break
                 if word_replaced:
-                    self.hack_guess_history.append((f"[БОНУС] {text}", "Убрана обманка"))
+                    self.command_history.append(("[БОНУС] Убрана обманка"))
                 else:
-                    self.hack_guess_history.append((f"[БОНУС] {text}", "Нет слов для удаления"))
+                    self.command_history.append(("[БОНУС] Нет слов для удаления"))
             
             # Удаляем использованный смайл из списка бонусов
             self.hack_bonus_codes.remove(text)
@@ -2267,7 +2555,7 @@ lib_vault_network.so (v1.4.0)
         
         # Проверка пароля (остальной код без изменений)
         matches = calculate_positional_matches(text, self.hack_correct_password)
-        self.hack_guess_history.append((text, f"{matches}/{len(self.hack_correct_password)} совпадений"))
+        self.command_history.append((f"{matches}/{len(self.hack_correct_password)} совпадений"))
         self.hack_attempts -= 1
         
         if text == self.hack_correct_password:
@@ -2279,9 +2567,7 @@ lib_vault_network.so (v1.4.0)
             
             self.output.clear()
             display_lines = self.hack_display[:]
-            display_lines.append("".ljust(43) + f">{text}")
-            display_lines.append("".ljust(43) + f">{matches}/{len(self.hack_correct_password)} совпадений")
-            display_lines.append("".ljust(43) + ">Пароль принят")
+            display_lines.append(">Пароль принят")
             display_lines.append("")
             display_lines.append(f">Вы авторизованы как: {self.current_user}")
             
@@ -2817,6 +3103,17 @@ lib_vault_network.so (v1.4.0)
     # -------------------------------------------------------------- ввод
     def handle_submit(self, raw_text):
         text = raw_text.strip()
+        
+        # Добавляем в историю команд (с маскировкой пароля)
+        if self.state == self.STATE_PASSWORD:
+            # На экране пароля - маскируем звёздами
+            masked_text = "*" * len(text)
+            user_name = self.pending_user['name'] if self.pending_user else self.current_user
+            self.command_history.append(f"[{user_name}]: {masked_text}")
+        else:
+            # Для всех остальных состояний - обычный текст
+            if text:  # Добавляем только непустые команды
+                self.command_history.append(f"[{self.current_user}]: {text}")
 
         if self.state == self.STATE_USER_SELECT:
             if text.isdigit():
@@ -2839,7 +3136,6 @@ lib_vault_network.so (v1.4.0)
                 self._launch_hack_module()
                 return
             if text.upper() == self.pending_user["password"]:
-                self.output.push(f">[{self.pending_user['name']}]: {text}\n", instant=True)
                 self._play("unlocked")
                 self._apply_authenticated_user(self.pending_user)
                 self.state = self.STATE_AUTH_SUCCESS
@@ -2854,7 +3150,6 @@ lib_vault_network.so (v1.4.0)
                 self.output.push("\nДОСТУП ЗАПРЕЩЁН\nВыключение...\n", instant=True)
                 self._schedule(LOCKOUT_DELAY_SECONDS, self._quit)
             else:
-                self.output.push(f">[{self.pending_user['name']}]: {text}\n", instant=True)
                 self._play("error")
                 self._enter_password(extra_message="НЕВЕРНЫЙ ПАРОЛЬ")
             return
@@ -2867,7 +3162,6 @@ lib_vault_network.so (v1.4.0)
             return  # ввод игнорируем
 
         if self.state == self.STATE_MAIN_MENU:
-            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             self.system_logger.log(self.current_user, text, is_user_input=True)
             self._handle_main_menu(text)
             return
@@ -2883,7 +3177,6 @@ lib_vault_network.so (v1.4.0)
             return
 
         if self.state == self.STATE_LOG_LIST:
-            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if not self.log_entries:
                 # Пустой журнал: 1 — создать запись, 0 — назад
                 if text == "1":
@@ -2925,7 +3218,6 @@ lib_vault_network.so (v1.4.0)
             return
 
         if self.state == self.STATE_DOOR:
-            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if text == "1":
                 self.door_status = "ОТКРЫТА"
                 self._play("complete")
@@ -2939,7 +3231,6 @@ lib_vault_network.so (v1.4.0)
             return
         
         if self.state == self.STATE_SYSTEM_MENU:
-            self.output.push(f">[{self.current_user}]: {text}\n", instant=True)
             if text == "0" or text == "":
                 self._enter_main_menu()
                 return
@@ -3259,9 +3550,20 @@ lib_vault_network.so (v1.4.0)
                 else:
                     self.running = False
             elif event.key == pygame.K_UP:
-                self.output.scroll(SCROLL_STEP, self._current_max_lines())
+                self.command_history_scroll += SCROLL_STEP
+                line_h = self.font.get_linesize() + LINE_SPACING
+                pad = 10
+                header_height = 0
+                if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
+                    header_height = (len(HEADER_BANNER.split("\n")) + 2) * line_h + line_h * HEADER_GAP_LINES
+                sidebar_height = RENDER_H - MARGIN * 2 - header_height
+                max_lines = (sidebar_height - pad - line_h * 3) // line_h
+                max_lines = max(1, max_lines)
+                max_scroll = max(0, len(self.command_history) - max_lines)
+                self.command_history_scroll = min(self.command_history_scroll, max_scroll)
             elif event.key == pygame.K_DOWN:
-                self.output.scroll(-SCROLL_STEP, self._current_max_lines())
+                self.command_history_scroll -= SCROLL_STEP
+                self.command_history_scroll = max(0, self.command_history_scroll)
             elif event.key == pygame.K_RETURN:
                 self._play("clack")
                 if self.state == self.STATE_HACK_MINIGAME:
@@ -3364,8 +3666,23 @@ lib_vault_network.so (v1.4.0)
             return
 
         if now - self._scroll_hold_start >= self._scroll_repeat_delay and now >= self._scroll_next_repeat_at:
-            direction = SCROLL_STEP if held_up else -SCROLL_STEP
-            self.output.scroll(direction, self._current_max_lines())
+            if held_up:
+                self.command_history_scroll += SCROLL_STEP
+                # Вычисляем максимальное количество строк в правой колонке
+                line_h = self.font.get_linesize() + LINE_SPACING
+                pad = 10
+                header_height = 0
+                if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
+                    header_height = (len(HEADER_BANNER.split("\n")) + 2) * line_h + line_h * HEADER_GAP_LINES
+                sidebar_height = RENDER_H - MARGIN * 2 - header_height
+                max_lines = (sidebar_height - pad - line_h * 3) // line_h
+                max_lines = max(1, max_lines)
+                max_scroll = max(0, len(self.command_history) - max_lines)
+                self.command_history_scroll = min(self.command_history_scroll, max_scroll)
+            elif held_down:
+                self.command_history_scroll -= SCROLL_STEP
+                self.command_history_scroll = max(0, self.command_history_scroll)
+            
             self._scroll_next_repeat_at = now + self._scroll_repeat_interval
 
     def _render_splash(self, surf):
@@ -3402,14 +3719,15 @@ lib_vault_network.so (v1.4.0)
     def render(self):
         surf = self.render_surface
         surf.fill(COLOR_BG)
-
+        
+        # Особые состояния со своей вёрсткой
         if self.state == self.STATE_SPLASH:
             self._render_splash(surf)
             scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
             self.window.blit(scaled, (0, 0))
             pygame.display.flip()
             return
-
+        
         if self.state == self.STATE_DISK_READER:
             self._render_disk_reader(surf)
             surf.blit(self.scanlines, (0, 0))
@@ -3419,70 +3737,27 @@ lib_vault_network.so (v1.4.0)
             pygame.display.flip()
             return
         
-        if self.state == self.STATE_MAP:
-            # Левая широкая колонка — сама карта (с прицелом при наведении).
-            self._render_map(surf)
-            # Правая узкая колонка — подсказки/статус и системный текст,
-            # включая поле ввода названия отметки, если оно сейчас активно.
-            self._render_map_sidebar(surf)
-
-            # Применяем эффекты
-            bloom = make_bloom(surf)
-            surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-            surf.blit(self.scanlines, (0, 0))
-            surf.blit(self.vignette, (0, 0))
-        
+        if self.state == self.STATE_CHAT:
+            self._render_chat_fullscreen(surf)
             scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
             self.window.blit(scaled, (0, 0))
             pygame.display.flip()
             return
-
-        y = MARGIN
-        line_h = self.font.get_linesize() + LINE_SPACING
-        n = self._current_max_lines()
-
-        if self.fixed_header and self.state != self.STATE_HACK_MINIGAME:
-            for header_line in HEADER_BANNER.split("\n"):
-                header_surf = self.font.render(header_line, True, COLOR_TEXT)
-                surf.blit(header_surf, (MARGIN, y))
-                y += line_h
-
-            date_str = self._current_datetime_str()
-            user_str = f"Пользователь: {self.current_user}"
-            date_surf = self.font.render(date_str, True, COLOR_TEXT)
-            user_surf = self.font.render(user_str, True, COLOR_TEXT)
-            surf.blit(date_surf, (MARGIN, y))
-            surf.blit(user_surf, (RENDER_W - MARGIN - user_surf.get_width(), y))
-            y += line_h
-
-            y += line_h * HEADER_GAP_LINES
-
-        content_top_y = y
-        if self.output.has_more_above(n):
-            indicator = self.font.render("^ Листать вверх ^", True, COLOR_DIM)
-            surf.blit(indicator, (MARGIN, content_top_y))
-        y += line_h
-
-        visible = self.output.visible_lines(n)
-        for line in visible:
-            self.render_ansi_text(surf, line, MARGIN, y)
-            y += line_h
-
-        if self.output.has_more_below():
-            indicator = self.font.render("v Листать вниз v", True, COLOR_DIM)
-            surf.blit(indicator, (MARGIN, y))
-        y += line_h
-
-        if not self.output.is_typing() and self.state not in (self.STATE_CLOSING, self.STATE_AUTH_SUCCESS):
-            prompt = "> " + self.input_text + ("_" if self.cursor_visible else " ")
-            prompt_surf = self.font.render(prompt, True, COLOR_TEXT)
-            surf.blit(prompt_surf, (MARGIN, y))
-
-        bloom = make_bloom(surf)
-        surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-        surf.blit(self.scanlines, (0, 0))
-        surf.blit(self.vignette, (0, 0))
-
+        
+        if self.state == self.STATE_MAP:
+            self._render_map(surf)
+            self._render_map_sidebar(surf)
+            bloom = make_bloom(surf)
+            surf.blit(bloom, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
+            surf.blit(self.scanlines, (0, 0))
+            surf.blit(self.vignette, (0, 0))
+            scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
+            self.window.blit(scaled, (0, 0))
+            pygame.display.flip()
+            return
+        
+        # Все остальные состояния - двухколоночная вёрстка
+        self._render_two_column(surf)
         scaled = pygame.transform.smoothscale(surf, (WINDOW_W, WINDOW_H))
         self.window.blit(scaled, (0, 0))
         pygame.display.flip()
